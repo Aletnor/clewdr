@@ -1,4 +1,4 @@
-use std::{collections::HashMap, pin::Pin, str::FromStr};
+use std::{collections::HashMap, pin::Pin, str::FromStr, sync::LazyLock};
 
 use http::header::{COOKIE, USER_AGENT};
 use oauth2::{
@@ -18,12 +18,15 @@ use serde_json::Value;
 use snafu::{OptionExt, ResultExt};
 use url::Url;
 
-use super::chat::{CLAUDE_API_VERSION, CLAUDE_BETA_BASE};
+use super::{
+    chat::{CLAUDE_API_VERSION, CLAUDE_BETA_BASE},
+    oauth_login,
+};
 use crate::{
     claude_code_state::ClaudeCodeState,
     config::{
         CC_REDIRECT_URI, CC_TOKEN_URL, CLAUDE_CODE_USER_AGENT, CLEWDR_CONFIG, CookieStatus,
-        TokenInfo,
+        Reason, TokenInfo,
     },
     error::{CheckClaudeErr, ClewdrError, UnexpectedNoneSnafu, UrlSnafu, WreqSnafu},
 };
@@ -40,6 +43,12 @@ type ClaudeOauthClient = Client<
     EndpointNotSet,
     EndpointSet,
 >;
+
+/// One token refresh at a time, across every request. Upstream rotates the
+/// refresh token on use, so two requests refreshing side by side leave the
+/// slower one holding a token that has just been retired.
+static REFRESH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 struct OauthClient {
     client: wreq::Client,
@@ -211,7 +220,97 @@ impl ClaudeCodeState {
         Ok(())
     }
 
+    /// 授权登录的账号续期：只认 refresh_token，被拒了就判失效，等人回面板重新登录
+    async fn refresh_oauth_login(&mut self) -> Result<(), ClewdrError> {
+        let wreq_client = self.get_wreq_client();
+        let Some(cookie) = self.cookie.as_mut() else {
+            return Err(ClewdrError::UnexpectedNone {
+                msg: "No cookie found to refresh token",
+            });
+        };
+        let Some(token) = cookie.token.as_mut() else {
+            return Err(Reason::Null.into());
+        };
+        if !token.is_expired() {
+            return Ok(());
+        }
+        match oauth_login::refresh(&wreq_client, &token.refresh_token).await {
+            Ok(new) => {
+                token.access_token = new.access_token;
+                if let Some(rt) = new.refresh_token {
+                    token.refresh_token = rt;
+                }
+                token.expires_in = new.expires_in;
+                token.expires_at = chrono::Utc::now() + new.expires_in;
+                if new.refresh_expires_at.is_some() {
+                    cookie.oauth_refresh_expires_at = new.refresh_expires_at;
+                }
+                tracing::info!("OAuth login token refreshed");
+                Ok(())
+            }
+            Err(oauth_login::RefreshError::Rejected(why)) => {
+                tracing::warn!(
+                    "OAuth login expired ({}), the account needs to log in again",
+                    why
+                );
+                cookie.token = None;
+                Err(Reason::Null.into())
+            }
+            Err(oauth_login::RefreshError::Transient(why)) => {
+                tracing::warn!("OAuth login refresh failed, will retry later: {}", why);
+                Err(ClewdrError::UnexpectedNone {
+                    msg: "OAuth token refresh failed, try again later",
+                })
+            }
+        }
+    }
+
     pub async fn refresh_token(&mut self) -> Result<(), ClewdrError> {
+        let _guard = REFRESH_LOCK.lock().await;
+        // Whoever held the lock before us may have refreshed this very account.
+        self.adopt_stored_token().await;
+        let result = if self
+            .cookie
+            .as_ref()
+            .is_some_and(|c| c.cookie.is_oauth_login())
+        {
+            self.refresh_oauth_login().await
+        } else {
+            self.refresh_cookie_token().await
+        };
+        if result.is_ok() {
+            // Hand the token over before the lock opens, so the next one in
+            // line finds it instead of spending the old refresh token again.
+            self.return_cookie(None).await;
+        }
+        result
+    }
+
+    /// Take the stored token when it is newer than the one in this snapshot.
+    async fn adopt_stored_token(&mut self) {
+        let Some(mine) = self.cookie.as_mut() else {
+            return;
+        };
+        let Ok(status) = self.cookie_actor_handle.get_status().await else {
+            return;
+        };
+        let stored = status
+            .valid
+            .into_iter()
+            .chain(status.exhausted)
+            .find(|c| *c == *mine)
+            .and_then(|c| c.token);
+        if let Some(stored) = stored
+            && mine
+                .token
+                .as_ref()
+                .is_none_or(|t| stored.expires_at > t.expires_at)
+        {
+            mine.token = Some(stored);
+        }
+    }
+
+    async fn refresh_cookie_token(&mut self) -> Result<(), ClewdrError> {
         let wreq_client = self.get_wreq_client();
         let Some(CookieStatus {
             token: Some(ref mut token),

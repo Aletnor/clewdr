@@ -127,6 +127,13 @@ pub struct CookieStatus {
     pub weekly_sonnet_has_reset: Option<bool>,
     #[serde(default)]
     pub weekly_opus_has_reset: Option<bool>,
+
+    /// 授权登录的账号：登录时查到的邮箱，只给面板认人用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_email: Option<String>,
+    /// 授权登录的账号：refresh_token 的到期时刻（epoch 秒），上游给了才有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_refresh_expires_at: Option<i64>,
 }
 
 impl PartialEq for CookieStatus {
@@ -188,6 +195,8 @@ impl CookieStatus {
             weekly_has_reset: None,
             weekly_sonnet_has_reset: None,
             weekly_opus_has_reset: None,
+            oauth_email: None,
+            oauth_refresh_expires_at: None,
         })
     }
 
@@ -402,7 +411,26 @@ impl Default for ClewdrCookie {
     }
 }
 
+/// 授权登录账号的占位 cookie 都以这个开头
+const OAUTH_LOGIN_PREFIX: &str = "oauth-login-";
+
 impl ClewdrCookie {
+    /// 授权登录的账号没有网页 cookie，账号表又拿 cookie 当主键，所以按账号种子合成一个
+    /// 占位的。长相凑成原有格式校验认的样子（93 位 + `-` + 6 位 + `AA`），存进配置
+    /// 再读出来不会被当成坏 cookie 丢掉。同一个种子永远得到同一个占位 cookie。
+    pub fn oauth_login(seed: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let h = hex::encode(Sha256::digest(seed.as_bytes()));
+        Self {
+            inner: format!("{OAUTH_LOGIN_PREFIX}{h}-{}-oauth0AA", &h[..16]),
+        }
+    }
+
+    /// 是不是授权登录的账号（占位 cookie，不能拿去访问 claude.ai）
+    pub fn is_oauth_login(&self) -> bool {
+        self.inner.starts_with(OAUTH_LOGIN_PREFIX)
+    }
+
     pub fn ellipse(&self) -> String {
         let len = self.inner.len();
         if len > 20 {

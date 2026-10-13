@@ -12,6 +12,14 @@ use crate::{
 
 impl ClaudeCodeState {
     pub async fn get_organization(&self) -> Result<String, ClewdrError> {
+        // 授权登录的账号没有网页 cookie，走不了这条路；令牌没了就只能重新登录
+        if self
+            .cookie
+            .as_ref()
+            .is_some_and(|c| c.cookie.is_oauth_login())
+        {
+            return Err(Reason::Null.into());
+        }
         let end_point = self
             .endpoint
             .join("api/bootstrap")

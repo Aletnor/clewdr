@@ -123,7 +123,16 @@ impl ClaudeWebState {
     /// Requests a new cookie from the cookie manager
     /// Updates the internal state with the new cookie and proxy configuration
     pub async fn request_cookie(&mut self) -> Result<CookieStatus, ClewdrError> {
-        let res = self.cookie_actor_handle.request(None).await?;
+        let mut res = self.cookie_actor_handle.request(None).await?;
+        // 授权登录的账号没有网页 cookie，网页端用不了，轮到它就跳过换下一个
+        let mut skipped = 0;
+        while res.cookie.is_oauth_login() {
+            skipped += 1;
+            if skipped > 32 {
+                return Err(ClewdrError::NoCookieAvailable);
+            }
+            res = self.cookie_actor_handle.request(None).await?;
+        }
         self.cookie = Some(res.to_owned());
         // Always pull latest proxy/endpoint before building the client
         self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
@@ -181,6 +190,10 @@ impl ClaudeWebState {
     /// Fetch usage data via the claude.ai web endpoint.
     /// Used as a fallback when the OAuth usage endpoint is not available (e.g. Without Claude Code Access).
     pub async fn fetch_web_usage(handle: CookieActorHandle, cookie: CookieStatus) -> Option<Value> {
+        // 授权登录的账号没有网页 cookie，这条兜底路走不了
+        if cookie.cookie.is_oauth_login() {
+            return None;
+        }
         let mut state = ClaudeWebState::new(handle);
         state.cookie = Some(cookie.clone());
         state.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();

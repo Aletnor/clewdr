@@ -14,7 +14,7 @@ use wreq::Method;
 
 use crate::{
     claude_code_state::{ClaudeCodeState, TokenStatus},
-    config::{CLAUDE_CODE_USER_AGENT, CLEWDR_CONFIG, Claude1mChannel, ModelFamily},
+    config::{CLAUDE_CODE_USER_AGENT, CLEWDR_CONFIG, ModelFamily, Reason},
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     services::cookie_actor::CookieActorHandle,
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
@@ -48,6 +48,9 @@ impl ClaudeCodeState {
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
+        // The last account-wide rate limit met on the way, so that when every
+        // account turns out to be benched the client hears upstream's own words.
+        let mut last_limit: Option<ClewdrError> = None;
         for i in 0..CLEWDR_CONFIG.load().max_retries + 1 {
             if i > 0 {
                 info!("[RETRY] attempt: {}", i.to_string().green());
@@ -55,7 +58,16 @@ impl ClaudeCodeState {
             let mut state = self.to_owned();
             let p = p.to_owned();
 
-            let cookie = state.request_cookie().await?;
+            let cookie = match state.request_cookie().await {
+                Ok(cookie) => cookie,
+                Err(ClewdrError::NoCookieAvailable) => {
+                    return Err(match last_limit.take() {
+                        Some(limit) => limit,
+                        None => self.cooling_down_error().await,
+                    });
+                }
+                Err(e) => return Err(e),
+            };
             let retry = async {
                 match state.check_token() {
                     TokenStatus::None => {
@@ -98,16 +110,65 @@ impl ClaudeCodeState {
                         state.cookie.as_ref().unwrap().cookie.ellipse().green(),
                         e
                     );
-                    // 429 error
                     if let ClewdrError::InvalidCookie { reason } = e {
                         state.return_cookie(Some(reason.to_owned())).await;
+                        continue;
+                    }
+                    // A limit on the whole subscription benches the account until
+                    // it resets. Any other 429 belongs to one model or one kind of
+                    // request: the account stays, the client gets the 429 as it is.
+                    if let Some(reset_at) = Self::account_wide_limit(&e) {
+                        state
+                            .return_cookie(Some(Reason::TooManyRequest(reset_at)))
+                            .await;
+                        last_limit = Some(e);
                         continue;
                     }
                     return Err(e);
                 }
             }
         }
-        Err(ClewdrError::TooManyRetries)
+        Err(last_limit.unwrap_or(ClewdrError::TooManyRetries))
+    }
+
+    /// The reset time, when upstream says the limit that was hit covers the
+    /// whole subscription (the five hour or the seven day window) rather than
+    /// one model's own allowance.
+    fn account_wide_limit(error: &ClewdrError) -> Option<i64> {
+        match error {
+            ClewdrError::RateLimited {
+                reset_at,
+                claim: Some(claim),
+                ..
+            } if matches!(claim.as_str(), "five_hour" | "seven_day") => Some(*reset_at),
+            _ => None,
+        }
+    }
+
+    /// What to tell the client when no account can be handed out. If accounts
+    /// are sitting out a rate limit, say so and say until when, as a 429.
+    async fn cooling_down_error(&self) -> ClewdrError {
+        let Ok(status) = self.cookie_actor_handle.get_status().await else {
+            return ClewdrError::NoCookieAvailable;
+        };
+        let Some(reset_at) = status.exhausted.iter().filter_map(|c| c.reset_time).min() else {
+            return ClewdrError::NoCookieAvailable;
+        };
+        let beijing = chrono::FixedOffset::east_opt(8 * 3600).expect("valid offset");
+        let when = chrono::DateTime::from_timestamp(reset_at, 0)
+            .map(|t| t.with_timezone(&beijing).format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| reset_at.to_string());
+        ClewdrError::RateLimited {
+            reset_at,
+            claim: None,
+            inner: crate::error::ClaudeErrorBody {
+                message: serde_json::json!(format!(
+                    "账号在冷却中（上游限流），北京时间 {when} 恢复"
+                )),
+                r#type: "rate_limit_error".to_string(),
+                code: Some(429),
+            },
+        }
     }
 
     pub async fn send_chat(
@@ -121,22 +182,7 @@ impl ClaudeCodeState {
         };
         p.model = base_model;
 
-        let channel = Self::auto_1m_probe_channel(&p.model);
-        let cookie_support = self
-            .cookie
-            .as_ref()
-            .and_then(|cookie| channel.and_then(|ch| cookie.claude_1m_support(ch)));
-        let attempts: Vec<bool> = if channel.is_some() {
-            match cookie_support {
-                Some(false) => vec![false],
-                _ => vec![true, false],
-            }
-        } else if requested_1m {
-            vec![true, false]
-        } else {
-            vec![false]
-        };
-
+        let attempts = Self::context_1m_attempts(requested_1m);
         let model_family = Self::classify_model(&p.model);
         for (idx, use_context_1m) in attempts.iter().copied().enumerate() {
             match self
@@ -144,26 +190,20 @@ impl ClaudeCodeState {
                 .await
             {
                 Ok(response) => {
-                    if let Some(ch) = channel
-                        && use_context_1m
-                    {
-                        self.persist_claude_1m_support(ch, true).await;
-                    }
                     return self.handle_success_response(response, model_family).await;
                 }
                 Err(err) => {
                     let is_last_attempt = idx + 1 == attempts.len();
-                    let should_fallback = use_context_1m
-                        && !is_last_attempt
-                        && channel.is_some()
-                        && Self::is_context_1m_forbidden(&err);
-                    if should_fallback {
-                        if let Some(ch) = channel {
-                            self.persist_claude_1m_support(ch, false).await;
-                        }
-                        warn!("1M probe failed, disabling lane and retrying without 1M header");
+                    if use_context_1m && !is_last_attempt && Self::is_context_1m_refused(&err) {
+                        warn!("1M context refused, retrying without the 1M header");
                         continue;
                     }
+                    super::sigcheck::record_failure(
+                        self.api_format.to_string().as_str(),
+                        &p.model,
+                        &err.to_string(),
+                        Self::upstream_code(&err),
+                    );
                     return Err(err);
                 }
             }
@@ -198,21 +238,8 @@ impl ClaudeCodeState {
             .context(WreqSnafu {
                 msg: "Failed to send chat message",
             })?
-            .check_claude()
+            .check_claude_code()
             .await
-    }
-
-    async fn persist_claude_1m_support(&mut self, channel: Claude1mChannel, value: bool) {
-        if let Some(cookie) = self.cookie.as_mut() {
-            if cookie.claude_1m_support(channel) == Some(value) {
-                return;
-            }
-            cookie.set_claude_1m_support(channel, Some(value));
-            let cloned = cookie.clone();
-            if let Err(err) = self.cookie_actor_handle.return_cookie(cloned, None).await {
-                warn!("Failed to persist Claude 1M support state: {}", err);
-            }
-        }
     }
 
     async fn persist_count_tokens_allowed(&mut self, value: bool) {
@@ -358,50 +385,25 @@ impl ClaudeCodeState {
         };
         p.model = base_model;
 
-        let channel = Self::auto_1m_probe_channel(&p.model);
-        let cookie_support = self
-            .cookie
-            .as_ref()
-            .and_then(|cookie| channel.and_then(|ch| cookie.claude_1m_support(ch)));
-        let attempts: Vec<bool> = if channel.is_some() {
-            match cookie_support {
-                Some(false) => vec![false],
-                _ => vec![true, false],
-            }
-        } else if requested_1m {
-            vec![true, false]
-        } else {
-            vec![false]
-        };
-
+        let attempts = Self::context_1m_attempts(requested_1m);
         for (idx, use_context_1m) in attempts.iter().copied().enumerate() {
             match self
                 .execute_claude_count_tokens_request(&access_token, &p, use_context_1m)
                 .await
             {
                 Ok(response) => {
-                    if let Some(ch) = channel
-                        && use_context_1m
-                    {
-                        self.persist_claude_1m_support(ch, true).await;
-                    }
                     self.persist_count_tokens_allowed(true).await;
-                    let (resp, _) = Self::materialize_non_stream_response(response).await?;
+                    let (resp, _) = Self::materialize_non_stream_response(
+                        response,
+                        self.api_format.to_string().as_str(),
+                    )
+                    .await?;
                     return Ok(resp);
                 }
                 Err(err) => {
                     let is_last_attempt = idx + 1 == attempts.len();
-                    let should_fallback = use_context_1m
-                        && !is_last_attempt
-                        && channel.is_some()
-                        && Self::is_context_1m_forbidden(&err);
-                    if should_fallback {
-                        if let Some(ch) = channel {
-                            self.persist_claude_1m_support(ch, false).await;
-                        }
-                        warn!(
-                            "1M probe failed in count_tokens, disabling lane and retrying without 1M header"
-                        );
+                    if use_context_1m && !is_last_attempt && Self::is_context_1m_refused(&err) {
+                        warn!("1M context refused in count_tokens, retrying without the 1M header");
                         continue;
                     }
 
@@ -425,7 +427,9 @@ impl ClaudeCodeState {
         model_family: ModelFamily,
     ) -> Result<axum::response::Response, ClewdrError> {
         if !self.stream {
-            let (resp, usage_pair) = Self::materialize_non_stream_response(response).await?;
+            let (resp, usage_pair) =
+                Self::materialize_non_stream_response(response, self.api_format.to_string().as_str())
+                    .await?;
             let (input, output) = usage_pair.unwrap_or((self.usage.input_tokens as u64, 0));
             self.persist_usage_totals(input, output, model_family).await;
             Ok(resp)
@@ -466,16 +470,91 @@ impl ClaudeCodeState {
         let cookie = self.cookie.clone();
 
         let osum = output_sum.clone();
+        let mut claimed_model: Option<String> = None;
+        let mut signature_checked = false;
+        let upstream_status = response.status().as_u16();
+        let record = Arc::new(super::sigcheck::ResponseRecord::for_stream(
+            self.api_format.to_string().as_str(),
+            input_tokens,
+            output_sum.clone(),
+        ));
+        record.note_status(upstream_status);
+        let record_on_error = record.clone();
         let stream = response.bytes_stream().eventsource().map_ok(move |event| {
             // accumulate output tokens from message_delta usage if present
             if let Ok(parsed) =
                 serde_json::from_str::<crate::types::claude::StreamEvent>(&event.data)
             {
                 match parsed {
-                    crate::types::claude::StreamEvent::MessageDelta { usage: Some(u), .. } => {
-                        osum.fetch_add(u.output_tokens as u64, Ordering::Relaxed);
+                    crate::types::claude::StreamEvent::MessageDelta {
+                        ref delta,
+                        ref usage,
+                    } => {
+                        if let Some(u) = usage {
+                            osum.fetch_add(u.output_tokens as u64, Ordering::Relaxed);
+                        }
+                        if let Some(reason) = delta.stop_reason.as_ref() {
+                            record.note_reason(reason, &event.data);
+                        }
+                    }
+                    crate::types::claude::StreamEvent::Error { ref error } => {
+                        record.note_error_event(&error.type_, &error.message);
+                    }
+                    crate::types::claude::StreamEvent::MessageStart { ref message } => {
+                        claimed_model = Some(message.model.to_owned());
+                        record.note_claimed_model(&message.model);
+                        // The typed Usage has no cache fields, so read them
+                        // straight off the raw event. Once per response.
+                        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&event.data)
+                            && let Some(usage) = raw.pointer("/message/usage")
+                        {
+                            record.note_cache_usage(usage);
+                        }
+                    }
+                    crate::types::claude::StreamEvent::ContentBlockDelta {
+                        delta:
+                            crate::types::claude::ContentBlockDelta::TextDelta { ref text },
+                        ..
+                    } => {
+                        record.note_text(text);
+                    }
+                    // Upstream charges for the thinking chain inside the same
+                    // output_tokens as the reply, so it gets weighed here or a
+                    // one word answer after a long think reads as a long answer.
+                    crate::types::claude::StreamEvent::ContentBlockDelta {
+                        delta:
+                            crate::types::claude::ContentBlockDelta::ThinkingDelta {
+                                ref thinking,
+                            },
+                        ..
+                    } => {
+                        record.note_think(thinking);
+                    }
+                    crate::types::claude::StreamEvent::ContentBlockDelta {
+                        delta:
+                            crate::types::claude::ContentBlockDelta::InputJsonDelta {
+                                ref partial_json,
+                            },
+                        ..
+                    } => {
+                        record.note_tool_input(partial_json);
+                    }
+                    crate::types::claude::StreamEvent::ContentBlockDelta {
+                        delta:
+                            crate::types::claude::ContentBlockDelta::SignatureDelta {
+                                ref signature,
+                            },
+                        ..
+                    } => {
+                        if !signature_checked
+                            && let Some(claimed) = claimed_model.as_deref()
+                        {
+                            signature_checked = true;
+                            record.note_signature(claimed, signature);
+                        }
                     }
                     crate::types::claude::StreamEvent::MessageStop => {
+                        record.note_sent();
                         // on stream completion, persist totals asynchronously
                         if let (Some(cookie), handle) = (cookie.clone(), handle.clone()) {
                             let total_out = osum.load(Ordering::Relaxed);
@@ -491,6 +570,13 @@ impl ClaudeCodeState {
                     }
                     _ => {}
                 }
+            } else if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&event.data) {
+                if raw.get("type").and_then(|t| t.as_str()) == Some("message_delta")
+                    && let Some(reason) =
+                        raw.pointer("/delta/stop_reason").and_then(|r| r.as_str())
+                {
+                    record.note_reason_str(reason, &event.data);
+                }
             }
             // mirror upstream SSE event unchanged
             let e = SseEvent::default().event(event.event).id(event.id);
@@ -500,7 +586,8 @@ impl ClaudeCodeState {
                 e
             };
             e.data(event.data)
-        });
+        })
+        .inspect_err(move |e| record_on_error.note_transport_error(&e.to_string()));
 
         Ok(Sse::new(stream)
             .keep_alive(Default::default())
@@ -509,6 +596,7 @@ impl ClaudeCodeState {
 
     async fn materialize_non_stream_response(
         response: wreq::Response,
+        format: &str,
     ) -> Result<(axum::response::Response, Option<(u64, u64)>), ClewdrError> {
         let status = response.status();
         let headers = response.headers().clone();
@@ -516,6 +604,7 @@ impl ClaudeCodeState {
             msg: "Failed to read Claude response body",
         })?;
         let usage = Self::extract_usage_from_bytes(&bytes);
+        Self::inspect_response_bytes(&bytes, format, status.as_u16());
 
         let mut builder = http::Response::builder().status(status);
         for (key, value) in headers.iter() {
@@ -529,6 +618,72 @@ impl ClaudeCodeState {
                     source: e,
                 })?;
         Ok((response, usage))
+    }
+
+    fn inspect_response_bytes(bytes: &[u8], format: &str, code: u16) {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return;
+        };
+        // An error body has its own shape and no ending to report, so it
+        // gets a row of its own rather than vanishing. Anything else that
+        // lands here is a token count or similar bookkeeping, not a reply.
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("message") => {}
+            Some("error") => {
+                super::sigcheck::record_failure(format, "", &value.to_string(), Some(code));
+                return;
+            }
+            _ => return,
+        }
+        let usage = value.get("usage");
+        let token_count = |name: &str| {
+            usage
+                .and_then(|u| u.get(name))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        let record = super::sigcheck::ResponseRecord::for_single(
+            format,
+            token_count("input_tokens"),
+            token_count("output_tokens"),
+        );
+        record.note_status(code);
+        if let Some(usage) = usage {
+            record.note_cache_usage(usage);
+        }
+        if let Some(reason) = value.get("stop_reason").and_then(|r| r.as_str()) {
+            // Everything except the reply body, so the record gains the
+            // extra fields without gaining the conversation.
+            let mut trimmed = value.clone();
+            if let Some(obj) = trimmed.as_object_mut() {
+                obj.remove("content");
+            }
+            record.note_reason_str(reason, &trimmed.to_string());
+        }
+        let Some(claimed) = value.get("model").and_then(|m| m.as_str()) else {
+            return;
+        };
+        record.note_claimed_model(claimed);
+        let Some(blocks) = value.get("content").and_then(|c| c.as_array()) else {
+            return;
+        };
+        for block in blocks {
+            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                record.note_text(text);
+            }
+            if let Some(thinking) = block.get("thinking").and_then(|t| t.as_str()) {
+                record.note_think(thinking);
+            }
+            if let Some(input) = block.get("input") {
+                record.note_tool_input(&input.to_string());
+            }
+        }
+        for block in blocks {
+            if let Some(signature) = block.get("signature").and_then(|s| s.as_str()) {
+                record.note_signature(claimed, signature);
+                return;
+            }
+        }
     }
 
     fn extract_usage_from_bytes(bytes: &[u8]) -> Option<(u64, u64)> {
@@ -585,7 +740,7 @@ impl ClaudeCodeState {
             .context(WreqSnafu {
                 msg: "Failed to call Claude count_tokens",
             })?
-            .check_claude()
+            .check_claude_code()
             .await
     }
 
@@ -618,25 +773,16 @@ impl ClaudeCodeState {
         merged.join(",")
     }
 
-    fn auto_1m_probe_channel(model: &str) -> Option<Claude1mChannel> {
-        let m = model.to_ascii_lowercase();
-        if Self::is_sonnet_1m_probe_model(&m) {
-            Some(Claude1mChannel::Sonnet)
-        } else if Self::is_opus_1m_probe_model(&m) {
-            Some(Claude1mChannel::Opus)
+    /// The long context beta header goes out only when the client asked for it
+    /// with a `-1M` model suffix, and then with a plain retry behind it. It used
+    /// to be probed on every Sonnet 4.x / Opus 4.6 request, from the days when
+    /// that header was the only way to get the long window on those models.
+    fn context_1m_attempts(requested_1m: bool) -> Vec<bool> {
+        if requested_1m {
+            vec![true, false]
         } else {
-            None
+            vec![false]
         }
-    }
-
-    fn is_sonnet_1m_probe_model(model: &str) -> bool {
-        // Sonnet 4.x lanes (4 / 4.5 / 4.6 and dated variants) trigger 1M probing.
-        model.starts_with("claude-sonnet-4")
-    }
-
-    fn is_opus_1m_probe_model(model: &str) -> bool {
-        // Only Opus 4.6 lane should trigger 1M probing.
-        model.starts_with("claude-opus-4-6")
     }
 
     fn classify_model(model: &str) -> ModelFamily {
@@ -805,6 +951,23 @@ impl ClaudeCodeState {
         Json(estimate).into_response()
     }
 
+    /// The status upstream actually answered with, and only where the
+    /// mapping is exact. ClaudeHttpError carries the code itself, and the
+    /// rate-limit cookie reason is built in one place only, the 429 branch
+    /// of check_claude. Everything else gets no code rather than a plausible
+    /// one, because a status page that guesses is worse than one that admits
+    /// it never saw a response.
+    fn upstream_code(error: &ClewdrError) -> Option<u16> {
+        match error {
+            ClewdrError::ClaudeHttpError { code, .. } => Some(code.as_u16()),
+            ClewdrError::InvalidCookie {
+                reason: crate::config::Reason::TooManyRequest(_),
+            }
+            | ClewdrError::RateLimited { .. } => Some(429),
+            _ => None,
+        }
+    }
+
     fn is_context_1m_forbidden(error: &ClewdrError) -> bool {
         if let ClewdrError::ClaudeHttpError { code, inner } = error
             && matches!(code.as_u16(), 400 | 403 | 429)
@@ -825,6 +988,14 @@ impl ClaudeCodeState {
         false
     }
 
+    /// Whether a failed 1M attempt should be retried without the header. A rate
+    /// limit counts: upstream also answers 429 for long context it will not
+    /// serve, and benching the whole account over an optional header is the
+    /// wrong trade. If the account really is limited the plain retry says so.
+    fn is_context_1m_refused(error: &ClewdrError) -> bool {
+        Self::is_context_1m_forbidden(error) || matches!(error, ClewdrError::RateLimited { .. })
+    }
+
     fn is_count_tokens_unauthorized(error: &ClewdrError) -> bool {
         if let ClewdrError::ClaudeHttpError { code, .. } = error {
             return match code.as_u16() {
@@ -834,5 +1005,61 @@ impl ClaudeCodeState {
             };
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ClaudeErrorBody;
+
+    fn limited(claim: Option<&str>) -> ClewdrError {
+        ClewdrError::RateLimited {
+            reset_at: 1_800_000_000,
+            claim: claim.map(str::to_owned),
+            inner: ClaudeErrorBody {
+                message: serde_json::json!("slow down"),
+                r#type: "rate_limit_error".to_owned(),
+                code: Some(429),
+            },
+        }
+    }
+
+    #[test]
+    fn the_1m_header_goes_out_only_when_asked_for() {
+        assert_eq!(ClaudeCodeState::context_1m_attempts(false), vec![false]);
+        assert_eq!(ClaudeCodeState::context_1m_attempts(true), vec![true, false]);
+    }
+
+    #[test]
+    fn a_rate_limit_on_the_1m_attempt_falls_back_instead_of_benching() {
+        assert!(ClaudeCodeState::is_context_1m_refused(&limited(None)));
+        let dead = ClewdrError::InvalidCookie {
+            reason: Reason::Null,
+        };
+        assert!(!ClaudeCodeState::is_context_1m_refused(&dead));
+    }
+
+    #[test]
+    fn only_the_shared_windows_bench_the_account() {
+        assert_eq!(
+            ClaudeCodeState::account_wide_limit(&limited(Some("five_hour"))),
+            Some(1_800_000_000)
+        );
+        assert_eq!(
+            ClaudeCodeState::account_wide_limit(&limited(Some("seven_day"))),
+            Some(1_800_000_000)
+        );
+        // One model's own weekly allowance, extra usage, or a limit upstream
+        // did not name: the account keeps serving every other model.
+        for claim in [Some("seven_day_opus"), Some("seven_day_oi"), Some("overage"), None] {
+            assert_eq!(ClaudeCodeState::account_wide_limit(&limited(claim)), None);
+        }
+    }
+
+    #[test]
+    fn a_passed_on_rate_limit_keeps_its_status_and_its_words() {
+        let response = limited(Some("seven_day_oi")).into_response();
+        assert_eq!(response.status().as_u16(), 429);
     }
 }

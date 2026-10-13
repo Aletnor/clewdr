@@ -21,11 +21,14 @@ pub fn enabled(flag: bool) -> ColoredString {
 
 /// Helper function to print out JSON to a file in the log directory
 ///
+/// Debug builds only. These dumps hold whole request bodies, and a release
+/// build has no business keeping the last conversation on disk.
+///
 /// # Arguments
 /// * `json` - The JSON object to serialize and output
 /// * `file_name` - The name of the file to write in the log directory
 pub fn print_out_json(json: impl serde::ser::Serialize, file_name: &str) {
-    if CLEWDR_CONFIG.load().no_fs {
+    if !crate::IS_DEBUG || CLEWDR_CONFIG.load().no_fs {
         return;
     }
     let text = serde_json::to_string_pretty(&json).unwrap_or_default();
@@ -38,7 +41,7 @@ pub fn print_out_json(json: impl serde::ser::Serialize, file_name: &str) {
 /// * `text` - The text content to write
 /// * `file_name` - The name of the file to write in the log directory
 pub fn print_out_text(text: String, file_name: &str) {
-    if CLEWDR_CONFIG.load().no_fs {
+    if !crate::IS_DEBUG || CLEWDR_CONFIG.load().no_fs {
         return;
     }
     let path = LOG_DIR.join(file_name);

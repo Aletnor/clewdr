@@ -9,7 +9,10 @@ use snafu::{GenerateImplicitData, Location};
 use tracing::{error, info, warn};
 
 use crate::{
-    config::{CLEWDR_CONFIG, ClewdrConfig, CookieStatus, Reason, UsageBreakdown, UselessCookie},
+    config::{
+        CLEWDR_CONFIG, ClewdrConfig, CookieStatus, Reason, TokenInfo, UsageBreakdown,
+        UselessCookie,
+    },
     error::ClewdrError,
 };
 
@@ -22,6 +25,20 @@ pub struct CookieStatusInfo {
     pub valid: Vec<CookieStatus>,
     pub exhausted: Vec<CookieStatus>,
     pub invalid: Vec<UselessCookie>,
+}
+
+/// Of the token already stored and the one being handed back, keep whichever
+/// expires later. A refresh always moves the expiry forward, so the later one
+/// is the live one; a snapshot that lost its token never erases a stored one.
+fn newer_token(stored: Option<TokenInfo>, returned: Option<TokenInfo>) -> Option<TokenInfo> {
+    match (stored, returned) {
+        (Some(stored), Some(returned)) => Some(if returned.expires_at >= stored.expires_at {
+            returned
+        } else {
+            stored
+        }),
+        (stored, returned) => returned.or(stored),
+    }
 }
 
 /// Messages that the CookieActor can handle
@@ -210,9 +227,24 @@ impl CookieActor {
     /// Collects a returned cookie and processes it based on the return reason
     fn collect(state: &mut CookieActorState, mut cookie: CookieStatus, reason: Option<Reason>) {
         let Some(reason) = reason else {
+            // The snapshot coming back can be minutes old (a stream that just
+            // ended), and another request may have refreshed the token while it
+            // was out. Upstream rotates the refresh token on use, so writing the
+            // old pair back over the new one kills the login.
             if let Some(existing) = state.valid.iter_mut().find(|c| **c == cookie) {
+                cookie.token = newer_token(existing.token.take(), cookie.token.take());
                 *existing = cookie;
                 Self::save(state);
+            } else if let Some(mut existing) = state.exhausted.take(&cookie) {
+                // Cooling down: the cooldown stays as it is, but a token that
+                // got refreshed in the meantime must not be thrown away.
+                let merged = newer_token(existing.token.clone(), cookie.token.take());
+                let changed = merged != existing.token;
+                existing.token = merged;
+                state.exhausted.insert(existing);
+                if changed {
+                    Self::save(state);
+                }
             }
             return;
         };
@@ -427,7 +459,9 @@ impl Actor for CookieActor {
             }
             CookieActorMessage::Request(cache_hash, reply_port) => {
                 let result = self.dispatch(state, cache_hash);
-                reply_port.send(result)?;
+                if reply_port.send(result).is_err() {
+                    warn!("Request reply port closed, caller gone; actor stays alive");
+                }
             }
             CookieActorMessage::GetStatus(reply_port) => {
                 let changed = Self::refresh_usage_windows(state);
@@ -435,15 +469,21 @@ impl Actor for CookieActor {
                     Self::save(state);
                 }
                 let status_info = Self::report(state);
-                reply_port.send(status_info)?;
+                if reply_port.send(status_info).is_err() {
+                    warn!("GetStatus reply port closed, caller gone; actor stays alive");
+                }
             }
             CookieActorMessage::Delete(cookie, reply_port) => {
                 let result = Self::delete(state, cookie.clone());
-                reply_port.send(result)?;
+                if reply_port.send(result).is_err() {
+                    warn!("Delete reply port closed, caller gone; actor stays alive");
+                }
             }
             CookieActorMessage::Update1mSupport(cookie, reply_port) => {
                 let result = Self::update_1m_support(state, cookie);
-                reply_port.send(result)?;
+                if reply_port.send(result).is_err() {
+                    warn!("Update1mSupport reply port closed, caller gone; actor stays alive");
+                }
             }
         }
         Ok(())
@@ -557,5 +597,59 @@ impl CookieActorHandle {
                 msg: format!("Failed to communicate with CookieActor for update operation: {e}"),
             }
         })?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use chrono::TimeZone;
+
+    use super::*;
+    use crate::config::Organization;
+
+    fn token(name: &str, expires_at: i64) -> TokenInfo {
+        TokenInfo {
+            access_token: name.to_owned(),
+            expires_in: Duration::from_secs(28800),
+            organization: Organization {
+                uuid: "org".to_owned(),
+            },
+            refresh_token: format!("{name}-refresh"),
+            expires_at: Utc.timestamp_opt(expires_at, 0).unwrap(),
+        }
+    }
+
+    fn name(t: Option<TokenInfo>) -> Option<String> {
+        t.map(|t| t.access_token)
+    }
+
+    #[test]
+    fn a_stale_snapshot_cannot_roll_the_token_back() {
+        let kept = newer_token(Some(token("fresh", 2000)), Some(token("stale", 1000)));
+        assert_eq!(name(kept), Some("fresh".to_owned()));
+    }
+
+    #[test]
+    fn a_refreshed_token_replaces_the_stored_one() {
+        let kept = newer_token(Some(token("old", 1000)), Some(token("new", 2000)));
+        assert_eq!(name(kept), Some("new".to_owned()));
+        // A new login can land on the very same second; the one handed in wins.
+        let kept = newer_token(Some(token("old", 1000)), Some(token("relogin", 1000)));
+        assert_eq!(name(kept), Some("relogin".to_owned()));
+    }
+
+    #[test]
+    fn a_snapshot_without_a_token_never_erases_a_stored_one() {
+        assert_eq!(
+            name(newer_token(Some(token("kept", 1000)), None)),
+            Some("kept".to_owned())
+        );
+        assert_eq!(
+            name(newer_token(None, Some(token("first", 1000)))),
+            Some("first".to_owned())
+        );
+        assert_eq!(name(newer_token(None, None)), None);
     }
 }

@@ -1,4 +1,5 @@
 mod claude2oai;
+mod prompt_cache;
 mod request;
 mod response;
 mod stop_sequences;

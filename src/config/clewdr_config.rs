@@ -128,9 +128,30 @@ pub struct ClewdrConfig {
     #[serde(default)]
     pub custom_system: Option<String>,
 
+    // Prompt cache settings (Claude Code channel), can hot reload.
+    // See middleware/claude/prompt_cache.rs.
+    #[serde(default = "default_cache_on")]
+    pub auto_cache: bool,
+    #[serde(default = "default_cache_on")]
+    pub magic_cache: bool,
+    #[serde(default)]
+    pub cache_ttl: Option<String>,
+    // -1: stamp the last user message. n >= 0: SillyTavern's cachingAtDepth,
+    // stamp the messages n and n + 2 role switches from the end.
+    #[serde(default = "default_cache_depth")]
+    pub cache_at_depth: i64,
+
     // Skip field, can hot reload
     #[serde(skip)]
     pub wreq_proxy: Option<Proxy>,
+}
+
+fn default_cache_on() -> bool {
+    true
+}
+
+fn default_cache_depth() -> i64 {
+    -1
 }
 
 impl Default for ClewdrConfig {
@@ -164,6 +185,10 @@ impl Default for ClewdrConfig {
             skip_normal_pro: false,
             claude_code_client_id: None,
             custom_system: None,
+            auto_cache: default_cache_on(),
+            magic_cache: default_cache_on(),
+            cache_ttl: None,
+            cache_at_depth: default_cache_depth(),
             no_fs: false,
             log_to_file: false,
         }
@@ -236,6 +261,18 @@ impl ClewdrConfig {
 
     pub fn admin_auth(&self, key: &str) -> bool {
         key == self.admin_password
+    }
+
+    /// A blank key arriving from the panel means "leave it as it is". Without
+    /// this `validate` would roll a fresh random one, and whoever cleared the
+    /// field by accident is locked out of a key they have never seen.
+    pub fn keep_keys_if_blank(&mut self, current: &ClewdrConfig) {
+        if self.password.trim().is_empty() {
+            self.password = current.password.clone();
+        }
+        if self.admin_password.trim().is_empty() {
+            self.admin_password = current.admin_password.clone();
+        }
     }
 
     pub fn cc_client_id(&self) -> String {

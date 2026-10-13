@@ -1,20 +1,18 @@
-# Release Notes
+基于原版 clewdr v0.12.25 的魔改版。
 
-## What's New
-- Use native incognito mode (`is_temporary`) for non-preserved chats (PR #145 by @GottenHeave)
-- Web usage endpoint for enterprise accounts
-- Update TLS emulation to Chrome 145
+- 新模型（Fable、Opus 5 系、Sonnet 5 系、Opus 4.8）的思考链能正常显示
+- 自带提示词缓存，酒馆那边不用开缓存
+- 账户页支持「授权登录」，不用再贴 Cookie
+- 被限流时只有整个订阅的额度用完才冷却账号，单个模型的额度用完不影响别的模型
+- 令牌续期不会再被旧的盖回去
+- 不再把每条请求的全文写到硬盘上
+- 去掉了对 4.6 系默认带「百万上下文」请求头的老逻辑
+- 面板重做，手机上好用；新增「监控」页，数据由程序自己统计
 
-## Bug Fixes
-- Fix `clewdr.toml` file permissions on Unix: now created with `0600` instead of default umask (#122)
-- Add fallback for unknown `ContentBlock` types to prevent 422 deserialization errors (#97)
-- Fix OAI `ImageUrl` to Claude `Image` format conversion in Claude Code proxy (PR #121 by @DragonFSKY)
-- Fix enterprise usage tracking (PR #144 by @GottenHeave)
-- Work around a bug in `tower-serve-static` (#147)
+下载哪个：
 
-## Improvements
-- Unify HTTP client construction across codebase
-- Always use mimalloc as default allocator
-- Unpin `tracing-subscriber`, allow ANSI color output
-- Update dependencies to latest versions
-- Use distroless Docker image
+- `clewdr-windows-x86_64.zip`：Windows 电脑
+- `clewdr-android-aarch64.zip`：安卓手机（Termux）
+- `clewdr-musllinux-x86_64.zip`：Linux 服务器
+
+用法见仓库首页的说明。

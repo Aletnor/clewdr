@@ -18,10 +18,11 @@ use wreq::StatusCode;
 use super::error::ApiError;
 use crate::{
     VERSION_INFO,
-    claude_code_state::ClaudeCodeState,
+    claude_code_state::{ClaudeCodeState, oauth_login},
     claude_web_state::ClaudeWebState,
     config::{CLEWDR_CONFIG, CookieStatus},
     services::cookie_actor::CookieActorHandle,
+    utils::build_http_client,
 };
 
 /// Cache entry for cookie status responses
@@ -255,6 +256,66 @@ pub async fn api_delete_cookie(
     }
 }
 
+/// 授权登录第一步：生成登录页网址。verifier 留在服务器内存里，一刻钟内有效
+pub async fn api_oauth_start(AuthBearer(t): AuthBearer) -> Result<Json<Value>, ApiError> {
+    if !CLEWDR_CONFIG.load().admin_auth(&t) {
+        return Err(ApiError::unauthorized());
+    }
+    let (url, state) = oauth_login::start();
+    info!("OAuth login started");
+    Ok(Json(json!({ "url": url, "state": state })))
+}
+
+#[derive(Deserialize)]
+pub struct OauthFinishBody {
+    state: String,
+    code: String,
+}
+
+/// 授权登录第二步：拿回调页上的授权码换令牌，把账号放进账号表。
+/// 同一个账号重新登录会落在原来那条记录上（换上新令牌，用量统计保留）。
+pub async fn api_oauth_finish(
+    State(s): State<CookieActorHandle>,
+    AuthBearer(t): AuthBearer,
+    Json(body): Json<OauthFinishBody>,
+) -> Result<Json<Value>, ApiError> {
+    if !CLEWDR_CONFIG.load().admin_auth(&t) {
+        return Err(ApiError::unauthorized());
+    }
+    let proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
+    let client = build_http_client(proxy.as_ref())
+        .map_err(|e| ApiError::internal(format!("建不了网络连接：{e}")))?;
+    let login = oauth_login::finish(&client, &body.state, &body.code)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let fresh = login.status;
+
+    let existing = match s.get_status().await {
+        Ok(info) => info.valid.into_iter().find(|c| *c == fresh),
+        Err(_) => None,
+    };
+    let replaced = existing.is_some();
+    let result = match existing {
+        Some(mut old) => {
+            old.token = fresh.token;
+            old.oauth_email = fresh.oauth_email;
+            old.oauth_refresh_expires_at = fresh.oauth_refresh_expires_at;
+            s.return_cookie(old, None).await
+        }
+        None => {
+            // 冷却或失效名单里要是躺着这个账号的旧记录，先清掉，不然新的进不来
+            let _ = s.delete_cookie(fresh.clone()).await;
+            s.submit(fresh).await
+        }
+    };
+    if let Err(e) = result {
+        error!("Failed to store OAuth login: {}", e);
+        return Err(ApiError::internal(format!("令牌拿到了，存账号时出错：{e}")));
+    }
+    COOKIES_CACHE.invalidate(COOKIE_STATUS_CACHE_KEY);
+    Ok(Json(json!({ "email": login.email, "replaced": replaced })))
+}
+
 /// API endpoint to get the application version information
 ///
 /// # Returns
@@ -279,7 +340,15 @@ pub async fn api_auth(AuthBearer(t): AuthBearer) -> StatusCode {
     StatusCode::OK
 }
 
-const MODEL_LIST: [&str; 26] = [
+/// 给看门狗用的探针：只问账号管理器还在不在，不带密钥，也不去上游查用量
+pub async fn api_health(State(s): State<CookieActorHandle>) -> StatusCode {
+    match s.get_status().await {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+const MODEL_LIST: [&str; 42] = [
     "claude-3-7-sonnet-20250219",
     "claude-3-7-sonnet-20250219-thinking",
     "claude-sonnet-4-20250514",
@@ -306,12 +375,56 @@ const MODEL_LIST: [&str; 26] = [
     "claude-opus-4-6-thinking",
     "claude-opus-4-6-1M",
     "claude-opus-4-6-1M-thinking",
+    "claude-opus-4-8",
+    "claude-opus-4-8-thinking",
+    "claude-fable-5",
+    "claude-fable-5-thinking",
+    "claude-fable-5-1",
+    "claude-fable-5-1-thinking",
+    "claude-opus-5",
+    "claude-opus-5-thinking",
+    "claude-sonnet-5",
+    "claude-sonnet-5-thinking",
+    "claude-opus-4-7",
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
 ];
+
+/// Models that take an effort suffix on the name, and the suffixes. Both follow
+/// the handling in middleware/claude/request.rs: the suffix is stripped there
+/// and becomes output_config.effort, which only these models keep.
+const EFFORT_MODELS: [&str; 7] = [
+    "claude-opus-4-8",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+];
+const EFFORT_SUFFIXES: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+fn model_names() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let plain = MODEL_LIST.iter().map(|m| m.to_string());
+    let with_effort = EFFORT_MODELS
+        .iter()
+        .flat_map(|m| EFFORT_SUFFIXES.iter().map(move |s| format!("{m}-{s}")));
+    for name in plain.chain(with_effort) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
 
 /// API endpoint to get the list of available models
 /// Retrieves the list of models from the configuration
 pub async fn api_get_models() -> Json<Value> {
-    let data: Vec<Value> = MODEL_LIST
+    let data: Vec<Value> = model_names()
         .iter()
         .map(|model| {
             json!({
@@ -341,17 +454,22 @@ async fn augment_utilization(cookies: Vec<CookieStatus>, handle: CookieActorHand
         async move {
             let base = serde_json::to_value(&cookie).unwrap_or(json!({}));
             match fetch_usage_percent(cookie, handle).await {
-                Some((
-                    five_hour,
-                    five_reset,
-                    seven_day,
-                    seven_reset,
-                    seven_day_opus,
-                    opus_reset,
-                    seven_day_sonnet,
-                    sonnet_reset,
-                )) => {
+                Some(usage) => {
                     let mut obj = base;
+                    obj["scoped_limits"] = scoped_limits(&usage);
+                    let Some((
+                        five_hour,
+                        five_reset,
+                        seven_day,
+                        seven_reset,
+                        seven_day_opus,
+                        opus_reset,
+                        seven_day_sonnet,
+                        sonnet_reset,
+                    )) = extract_usage_fields(&usage)
+                    else {
+                        return obj;
+                    };
                     obj["session_utilization"] = json!(five_hour);
                     obj["session_resets_at"] = json!(five_reset);
                     obj["seven_day_utilization"] = json!(seven_day);
@@ -374,16 +492,7 @@ async fn augment_utilization(cookies: Vec<CookieStatus>, handle: CookieActorHand
 async fn fetch_usage_percent(
     cookie: CookieStatus,
     handle: CookieActorHandle,
-) -> Option<(
-    u32,
-    Option<String>,
-    u32,
-    Option<String>,
-    u32,
-    Option<String>,
-    u32,
-    Option<String>,
-)> {
+) -> Option<serde_json::Value> {
     let oauth_handle = handle.clone();
     let fallback_cookie = cookie.clone();
     let fallback_cookie_name = fallback_cookie.cookie.to_string();
@@ -405,7 +514,40 @@ async fn fetch_usage_percent(
         .await
         .ok()?;
 
-    extract_usage_fields(&usage)
+    Some(usage)
+}
+
+/// 上游 `limits` 数组里按模型单独计的周额度（如 Fable），原样摘出来给面板显示
+fn scoped_limits(usage: &serde_json::Value) -> Value {
+    let items = usage
+        .get("limits")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|l| l.get("kind").and_then(|k| k.as_str()) == Some("weekly_scoped"))
+                .map(|l| {
+                    let scope = l.get("scope");
+                    let name = scope
+                        .and_then(|s| s.get("model"))
+                        .and_then(|m| m.get("display_name").or_else(|| m.get("id")))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| {
+                            scope
+                                .and_then(|s| s.get("surface"))
+                                .and_then(|v| v.as_str())
+                        })
+                        .unwrap_or("scoped");
+                    json!({
+                        "name": name,
+                        "percent": l.get("percent").and_then(|v| v.as_f64()).map(|v| v.round() as u32).unwrap_or(0),
+                        "resets_at": l.get("resets_at").and_then(|v| v.as_str()),
+                        "severity": l.get("severity").and_then(|v| v.as_str()),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Value::Array(items)
 }
 
 /// Try the OAuth endpoint (`api.anthropic.com/api/oauth/usage`)

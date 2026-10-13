@@ -43,10 +43,17 @@ fn normalize_message(msg: Message) -> Option<Message> {
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum Effort {
+    #[serde(alias = "minimal")]
+    Min = 128,
     Low = 256,
+    Auto = 1024,
     #[default]
     Medium = 256 * 8,
     High = 256 * 8 * 8,
+    #[serde(alias = "x_high")]
+    Xhigh = 256 * 8 * 8 * 2,
+    #[serde(alias = "maximum")]
+    Max = 256 * 8 * 8 * 4,
 }
 
 impl From<CreateMessageParams> for ClaudeCreateMessageParams {
@@ -80,7 +87,7 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             stop_sequences: params.stop,
             thinking: params
                 .thinking
-                .or_else(|| params.reasoning_effort.map(|e| Thinking::new(e as u64))),
+                .or_else(|| params.reasoning_effort.clone().map(|e| Thinking::new(e as u64))),
             temperature: params.temperature,
             stream: params.stream,
             top_k: params.top_k,
@@ -88,7 +95,21 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             tools: params.tools,
             tool_choice: params.tool_choice,
             metadata: params.metadata,
-            output_config: None,
+            output_config: params.reasoning_effort.and_then(|e| {
+                // Rank-based 1:1 mapping: ST dropdown position -> Claude level
+                let effort = match e {
+                    Effort::Auto => return None,
+                    Effort::Min => OutputEffort::Low,
+                    Effort::Low => OutputEffort::Medium,
+                    Effort::Medium => OutputEffort::High,
+                    Effort::High | Effort::Xhigh => OutputEffort::Xhigh,
+                    Effort::Max => OutputEffort::Max,
+                };
+                Some(OutputConfig {
+                    effort: Some(effort),
+                    format: None,
+                })
+            }),
             output_format: None,
             service_tier: None,
             n: params.n,

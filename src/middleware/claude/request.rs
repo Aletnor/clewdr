@@ -20,7 +20,8 @@ use crate::{
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
     types::{
         claude::{
-            ContentBlock, CreateMessageParams, Message, MessageContent, Role, Thinking, Usage,
+            ContentBlock, CreateMessageParams, Message, MessageContent, OutputConfig,
+            OutputEffort, Role, Thinking, Usage,
         },
         oai::CreateMessageParams as OaiCreateMessageParams,
     },
@@ -341,11 +342,69 @@ where
     type Rejection = ClewdrError;
 
     async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
-        let anthropic_beta = extract_anthropic_beta_header(req.headers());
+        let mut anthropic_beta = extract_anthropic_beta_header(req.headers());
         let NormalizeRequest(mut body, format) = NormalizeRequest::from_request(req, &()).await?;
         // Handle thinking mode by modifying the model name
         if body.temperature.is_some() {
             body.top_p = None; // temperature and top_p cannot be used together in Opus-4.x
+        }
+
+        // New-generation models (Fable 5, Opus 4.8, ...) encrypt their thinking
+        // and only emit visible thinking_delta events when the request asks for
+        // adaptive+summarized thinking. Clients like SillyTavern don't send a
+        // thinking field, so inject it here for these models. Adaptive mode also
+        // requires temperature == 1 and forbids top_k/top_p, so normalize those.
+        // Effort suffix on model name (e.g. claude-opus-5-high): strip it and
+        // map to output_config.effort. Explicit output_config wins over suffix.
+        for (suf, eff) in [
+            ("-xhigh", OutputEffort::Xhigh),
+            ("-high", OutputEffort::High),
+            ("-medium", OutputEffort::Medium),
+            ("-low", OutputEffort::Low),
+            ("-max", OutputEffort::Max),
+        ] {
+            if let Some(stripped) = body.model.strip_suffix(suf) {
+                body.model = stripped.to_string();
+                let oc = body.output_config.get_or_insert(OutputConfig {
+                    effort: None,
+                    format: None,
+                });
+                if oc.effort.is_none() {
+                    oc.effort = Some(eff);
+                }
+                break;
+            }
+        }
+        // Re-strip -thinking in case it preceded the effort suffix
+        if body.model.ends_with("-thinking") {
+            body.model = body.model.trim_end_matches("-thinking").to_string();
+        }
+
+        let model_lc = body.model.to_ascii_lowercase();
+        let needs_adaptive_thinking =
+            model_lc.contains("fable") || model_lc.contains("opus-4-8") || model_lc.contains("opus-5") || model_lc.contains("sonnet-5");
+        if needs_adaptive_thinking && !matches!(body.thinking, Some(Thinking::Disabled)) {
+            body.thinking = Some(Thinking::Adaptive {
+                display: Some("summarized".to_string()),
+            });
+            body.top_k = None;
+            body.top_p = None;
+            body.temperature = Some(1.0);
+            if body.max_tokens < 16000 {
+                body.max_tokens = 16000;
+            }
+        }
+        if !needs_adaptive_thinking {
+            if let Some(oc) = &mut body.output_config {
+                oc.effort = None;
+            }
+            if body
+                .output_config
+                .as_ref()
+                .is_some_and(|oc| oc.effort.is_none() && oc.format.is_none())
+            {
+                body.output_config = None;
+            }
         }
 
         // Check for test messages and respond appropriately
@@ -375,6 +434,27 @@ where
 
         if let Some(system) = body.system.as_mut() {
             strip_ephemeral_scope_from_system(system);
+        }
+
+        // Prompt-cache breakpoints, see prompt_cache.rs. Runs after the
+        // system prefix is final so the last system block is the whole prefix.
+        let cache_opts = {
+            let cfg = CLEWDR_CONFIG.load();
+            super::prompt_cache::CacheOptions {
+                auto: cfg.auto_cache,
+                magic: cfg.magic_cache,
+                ttl: cfg.cache_ttl.clone(),
+                depth: usize::try_from(cfg.cache_at_depth).ok(),
+            }
+        };
+        let cache = super::prompt_cache::apply(&mut body, &cache_opts);
+        if cache.breakpoints > 0 && cache_opts.ttl.as_deref().map(str::trim) == Some("1h") {
+            let beta = super::prompt_cache::EXTENDED_TTL_BETA;
+            anthropic_beta = Some(match anthropic_beta.take() {
+                Some(existing) if existing.split(',').any(|t| t.trim() == beta) => existing,
+                Some(existing) => format!("{existing},{beta}"),
+                None => beta.to_owned(),
+            });
         }
 
         let cache_systems = body
@@ -416,12 +496,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_code_billing_header_matches_2176_rule() {
+    fn claude_code_billing_header_matches_21280_rule() {
         let messages = vec![Message::new_text(Role::User, "hey")];
 
         assert_eq!(
             claude_code_billing_header(&messages),
-            "x-anthropic-billing-header: cc_version=2.1.76.4dc; cc_entrypoint=cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli; cch=00000;"
         );
     }
 
@@ -446,7 +526,7 @@ mod tests {
 
         assert_eq!(
             claude_code_billing_header(&messages),
-            "x-anthropic-billing-header: cc_version=2.1.76.540; cc_entrypoint=cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.280.5b1; cc_entrypoint=cli; cch=00000;"
         );
     }
 

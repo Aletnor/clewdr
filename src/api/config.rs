@@ -42,11 +42,12 @@ pub async fn api_get_config(
 /// * `Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>` - Success message on success, error response on failure
 pub async fn api_post_config(
     AuthBearer(t): AuthBearer,
-    Json(c): Json<ClewdrConfig>,
+    Json(mut c): Json<ClewdrConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !CLEWDR_CONFIG.load().admin_auth(&t) {
         return Err(ApiError::unauthorized());
     }
+    c.keep_keys_if_blank(&CLEWDR_CONFIG.load());
     let c = c.validate();
     // update config
     CLEWDR_CONFIG.rcu(|old_c| {

@@ -30,6 +30,9 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+/// GitHub account whose `clewdr` repository holds this fork's releases.
+const FORK_OWNER: &str = "Aletnor";
+
 /// Updater for the ClewdR application
 /// Handles checking for updates and updating the application
 pub struct ClewdrUpdater {
@@ -45,18 +48,16 @@ impl ClewdrUpdater {
     /// # Returns
     /// * `Result<Self, ClewdrError>` - A new updater instance or an error
     pub fn new() -> Result<Self, ClewdrError> {
-        let authors = option_env!("CARGO_PKG_AUTHORS").unwrap_or_default();
-        let repo_owner = authors
-            .split(':')
-            .next()
-            .and_then(|author| author.split('<').next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Xerxes-2");
+        // This fork's own releases. The stock updater derived the owner from the
+        // crate authors, which points at upstream, and an update from there
+        // would replace the fork with the stock build.
+        let repo_owner = FORK_OWNER;
         let repo_name = env!("CARGO_PKG_NAME");
         let policy = wreq::redirect::Policy::default();
+        // A machine that cannot reach GitHub must not hang at startup over this.
         let client = wreq::Client::builder()
             .redirect(policy)
+            .timeout(std::time::Duration::from_secs(8))
             .build()
             .context(WreqSnafu {
                 msg: "Failed to create HTTP client",
@@ -166,6 +167,8 @@ impl ClewdrUpdater {
             .client
             .get(&asset.browser_download_url)
             .header(USER_AGENT, &self.user_agent)
+            // The short client timeout is for the version check, not for this.
+            .timeout(std::time::Duration::from_secs(600))
             .send()
             .await
             .context(WreqSnafu {

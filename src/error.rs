@@ -143,6 +143,19 @@ pub enum ClewdrError {
         code: StatusCode,
         inner: ClaudeErrorBody,
     },
+    /// A 429 on the Claude Code channel, kept whole: when it resets, which
+    /// limit upstream says was hit, and upstream's own words for the client.
+    #[snafu(display(
+        "Rate limited ({}), until {}: {}",
+        claim.as_deref().unwrap_or("limit not named"),
+        Reason::TooManyRequest(*reset_at),
+        inner.to_string()
+    ))]
+    RateLimited {
+        reset_at: i64,
+        claim: Option<String>,
+        inner: ClaudeErrorBody,
+    },
     #[snafu(display("Unexpected None: {}", msg))]
     UnexpectedNone { msg: &'static str },
     #[snafu(display("IO error: {}", source))]
@@ -189,6 +202,13 @@ impl IntoResponse for ClewdrError {
             }
             ClewdrError::ClaudeHttpError { code, inner } => {
                 return (code, Json(ClaudeError { error: inner })).into_response();
+            }
+            ClewdrError::RateLimited { inner, .. } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ClaudeError { error: inner }),
+                )
+                    .into_response();
             }
             ClewdrError::TestMessage => {
                 return (
@@ -281,6 +301,10 @@ where
     Self: Sized,
 {
     fn check_claude(self) -> impl Future<Output = Result<Self, ClewdrError>>;
+    /// Same checks for the Claude Code channel, except that a 429 comes back
+    /// as `RateLimited` with everything upstream said, instead of a bare
+    /// cooldown time for the whole account.
+    fn check_claude_code(self) -> impl Future<Output = Result<Self, ClewdrError>>;
 }
 
 impl CheckClaudeErr for Response {
@@ -404,6 +428,57 @@ impl CheckClaudeErr for Response {
         Err(ClewdrError::ClaudeHttpError {
             code: status,
             inner: inner_error,
+        })
+    }
+
+    async fn check_claude_code(self) -> Result<Self, ClewdrError> {
+        if self.status() != 429 {
+            return self.check_claude().await;
+        }
+        let text_of = |name: &str| {
+            self.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let claim = text_of("anthropic-ratelimit-unified-representative-claim");
+        let reset_header =
+            text_of("anthropic-ratelimit-unified-reset").and_then(|v| v.parse::<i64>().ok());
+        // Every rate limit header upstream sent, so the log shows which window
+        // said no. These carry utilisation numbers and times, nothing private.
+        let seen = self
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                let name = k.as_str().strip_prefix("anthropic-ratelimit-unified-")?;
+                Some(format!("{}={}", name, v.to_str().unwrap_or("?")))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = self.text().await.unwrap_or_default();
+        let inner = match serde_json::from_str::<ClaudeError>(&text) {
+            Ok(err) => err.error,
+            Err(_) => ClaudeErrorBody {
+                message: json!(text),
+                r#type: "rate_limit_error".to_string(),
+                code: Some(429),
+            },
+        };
+        // Without a reset time the limit is assumed short, since nothing gets
+        // benched on this number unless upstream also names an account-wide claim.
+        let reset_at = inner.message["resetsAt"]
+            .as_i64()
+            .or(reset_header)
+            .unwrap_or_else(|| Utc::now().timestamp() + 300);
+        error!(
+            "Upstream 429, claim: {}, headers: [{}]",
+            claim.as_deref().unwrap_or("not named"),
+            seen
+        );
+        Err(ClewdrError::RateLimited {
+            reset_at,
+            claim,
+            inner,
         })
     }
 }

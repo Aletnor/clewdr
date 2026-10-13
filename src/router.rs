@@ -101,9 +101,12 @@ impl RouterBuilder {
                     .post(api_post_cookie)
                     .put(api_put_cookie),
             )
+            .route("/oauth/start", post(api_oauth_start))
+            .route("/oauth/finish", post(api_oauth_finish))
             .with_state(self.cookie_actor_handle.to_owned());
         let admin_router = Router::new()
             .route("/auth", get(api_auth))
+            .route("/monitor", get(api_monitor))
             .route("/config", get(api_get_config).post(api_post_config));
         let router = Router::new()
             .nest(
@@ -112,7 +115,12 @@ impl RouterBuilder {
                     .merge(admin_router)
                     .layer(from_extractor::<RequireAdminAuth>()),
             )
-            .route("/api/version", get(api_version));
+            .route("/api/version", get(api_version))
+            .merge(
+                Router::new()
+                    .route("/api/health", get(api_health))
+                    .with_state(self.cookie_actor_handle.to_owned()),
+            );
         self.inner = self.inner.merge(router);
         self
     }

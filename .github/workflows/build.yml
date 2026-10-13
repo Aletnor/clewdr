@@ -1,14 +1,11 @@
 name: build
 
+# Builds run for a version tag (which also publishes a release) or by hand.
+# Not on every push: the Windows runner alone costs double minutes.
 on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
   workflow_dispatch:
 
 env:
@@ -58,41 +55,24 @@ jobs:
     name: Build binary
     needs: build-frontend
     strategy:
+      fail-fast: false
       matrix:
-        os: [linux, musllinux, android, windows, macos]
-        target_arch: [x86_64, aarch64]
+        # The three places this fork is actually run: a Windows PC, an Android
+        # phone under Termux, and a Linux server (static musl, any distro).
         include:
-          # rust target vendor + system + environment
-          - os: android
-            target_vendor_sys_env: linux-android
-          - os: macos
-            target_vendor_sys_env: apple-darwin
-          - os: linux
-            target_vendor_sys_env: unknown-linux-gnu
-          - os: musllinux
-            target_vendor_sys_env: unknown-linux-musl
           - os: windows
+            target_arch: x86_64
             target_vendor_sys_env: pc-windows-msvc
-          # runner
-          - os: linux
-            target_arch: x86_64
-            runner: ubuntu-latest
-          - os: linux
-            target_arch: aarch64
-            runner: ubuntu-24.04-arm
-          - os: android
-            runner: ubuntu-latest
-          - os: windows
             runner: windows-latest
-          - os: macos
-            runner: macos-latest
-          # musl packages
-          - os: musllinux
-            cross: true
-            runner: ubuntu-latest
-        exclude:
           - os: android
+            target_arch: aarch64
+            target_vendor_sys_env: linux-android
+            runner: ubuntu-latest
+          - os: musllinux
             target_arch: x86_64
+            target_vendor_sys_env: unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
 
     runs-on: ${{ matrix.runner }}
     steps:

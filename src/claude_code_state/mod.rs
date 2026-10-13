@@ -1,6 +1,9 @@
 mod chat;
 mod exchange;
+pub mod oauth_login;
 mod organization;
+mod sigcheck;
+pub use sigcheck::record_path;
 use http::{
     HeaderValue, Method,
     header::{COOKIE, ORIGIN, REFERER, USER_AGENT},
@@ -59,16 +62,15 @@ impl ClaudeCodeState {
     ) -> Result<Self, ClewdrError> {
         let mut state = Self::new(cookie_actor_handle);
         state.cookie = Some(cookie);
-        let cookie_value = state
-            .cookie
-            .as_ref()
-            .ok_or(ClewdrError::UnexpectedNone {
-                msg: "Cookie missing while initializing state",
-            })?
-            .cookie
-            .to_string();
-        let header_value = HeaderValue::from_str(cookie_value.as_str())?;
-        state.cookie_header_value = header_value.clone();
+        let cookie_ref = state.cookie.as_ref().ok_or(ClewdrError::UnexpectedNone {
+            msg: "Cookie missing while initializing state",
+        })?;
+        // 授权登录的账号只有占位 cookie，不往外发
+        if !cookie_ref.cookie.is_oauth_login() {
+            let cookie_value = cookie_ref.cookie.to_string();
+            let header_value = HeaderValue::from_str(cookie_value.as_str())?;
+            state.cookie_header_value = header_value;
+        }
         state.client = build_http_client(state.proxy.as_ref()).context(WreqSnafu {
             msg: "Failed to build client for cookie",
         })?;
@@ -117,7 +119,12 @@ impl ClaudeCodeState {
             .request(self.system_prompt_hash)
             .await?;
         self.cookie = Some(res.to_owned());
-        self.cookie_header_value = HeaderValue::from_str(res.cookie.to_string().as_str())?;
+        // 授权登录的账号只有占位 cookie，不往外发
+        self.cookie_header_value = if res.cookie.is_oauth_login() {
+            HeaderValue::from_static("")
+        } else {
+            HeaderValue::from_str(res.cookie.to_string().as_str())?
+        };
         // Always pull latest proxy/endpoint before building the client
         self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
         self.endpoint = CLEWDR_CONFIG.load().endpoint();

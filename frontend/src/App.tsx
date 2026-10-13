@@ -1,104 +1,167 @@
-// frontend/src/App.tsx
-import { useState, useEffect } from "react";
-import { useTranslation } from "react-i18next";
-import "./App.css";
-import MainLayout from "./components/layout/MainLayout";
-import Card from "./components/common/Card";
-import TabNavigation from "./components/common/TabNavigation";
-import AuthGatekeeper from "./components/auth/AuthGatekeeper";
-import LogoutPanel from "./components/auth/LogoutPanel";
-import ClaudeTabs from "./components/claude";
-import ConfigTab from "./components/config";
-import StatusMessage from "./components/common/StatusMessage";
-import ErrorBoundary from "./components/common/ErrorBoundary";
-import { useAppContext } from "./context/AppContext";
+import { useCallback, useEffect, useState } from "react";
+import { Toaster } from "react-hot-toast";
+import { checkPassword, getVersion, token } from "./api";
+import Accounts from "./components/Accounts";
+import Login from "./components/Login";
+import Monitor from "./components/Monitor";
+import Settings from "./components/Settings";
+import { useTheme } from "./theme";
+import { Icon, Logo, Spinner } from "./components/ui";
 
-function App() {
-  const { t } = useTranslation();
-  const {
-    version,
-    isAuthenticated,
-    setIsAuthenticated,
-    activeTab,
-    setActiveTab,
-  } = useAppContext();
+type Tab = "accounts" | "watch" | "settings";
 
-  const [passwordChanged, setPasswordChanged] = useState(false);
+const TABS: { id: Tab; label: string }[] = [
+  { id: "accounts", label: "账户" },
+  { id: "watch", label: "监控" },
+  { id: "settings", label: "设置" },
+];
+
+const readTab = (): Tab => {
+  try {
+    const t = localStorage.getItem("clewdr.tab");
+    if (t === "accounts" || t === "watch" || t === "settings") return t;
+  } catch {
+    /* 隐私模式 */
+  }
+  return "accounts";
+};
+
+export default function App() {
+  const [auth, setAuth] = useState<"checking" | "in" | "out">(token.get() ? "checking" : "out");
+  const [notice, setNotice] = useState(() => {
+    const p = new URLSearchParams(location.search);
+    if (p.get("passwordChanged") === "true") {
+      history.replaceState({}, "", location.pathname);
+      return "管理员密钥已变更，请使用新密钥登录";
+    }
+    return "";
+  });
+  const [tab, setTab] = useState<Tab>(readTab);
+  const [version, setVersion] = useState("");
+  const [leaving, setLeaving] = useState(false);
+  const { theme, toggle } = useTheme();
 
   useEffect(() => {
-    // Check if redirected due to password change
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("passwordChanged") === "true") {
-      setPasswordChanged(true);
-      // Clean up the URL
-      window.history.replaceState({}, document.title, window.location.pathname);
-    }
+    if (!leaving) return;
+    const t = setTimeout(() => setLeaving(false), 3000);
+    return () => clearTimeout(t);
+  }, [leaving]);
+
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => {});
+    const t = token.get();
+    if (!t) return;
+    checkPassword(t)
+      .then((ok) => {
+        if (!ok) token.clear();
+        setAuth(ok ? "in" : "out");
+      })
+      .catch(() => setAuth("in"));
   }, []);
 
-  // Function to handle successful authentication
-  const handleAuthenticated = (status: boolean) => {
-    setIsAuthenticated(status);
+  const kick = useCallback((msg?: string) => {
+    token.clear();
+    setNotice(msg || "会话已失效，请重新登录");
+    setAuth("out");
+  }, []);
+
+  const go = (t: Tab) => {
+    setTab(t);
+    try {
+      localStorage.setItem("clewdr.tab", t);
+    } catch {
+      /* 隐私模式 */
+    }
+    window.scrollTo({ top: 0 });
   };
 
-  // Function to handle logout
-  const handleLogout = () => {
-    localStorage.removeItem("authToken");
-    setIsAuthenticated(false);
-  };
+  const toaster = (
+    <Toaster
+      position="top-center"
+      toastOptions={{
+        style: {
+          background: "var(--float-solid)",
+          color: "var(--text)",
+          border: "1px solid var(--line-hi)",
+          boxShadow: "var(--shadow-pop)",
+          borderRadius: 999,
+          fontSize: 14,
+          padding: "8px 16px",
+          backdropFilter: "blur(12px)",
+        },
+        success: { iconTheme: { primary: "var(--honey)", secondary: "var(--on-honey)" } },
+        error: { iconTheme: { primary: "var(--rose)", secondary: "#fff" } },
+      }}
+    />
+  );
 
-  // Define tabs for the authenticated user
-  const tabs = [
-    { id: "claude", label: t("tabs.claude"), color: "cyan" },
-    { id: "config", label: t("tabs.config"), color: "green" },
-    { id: "token", label: t("tabs.auth"), color: "violet" },
-  ];
+  if (auth === "checking")
+    return (
+      <div className="login" style={{ color: "var(--honey)" }}>
+        <Spinner size={28} />
+      </div>
+    );
+
+  if (auth === "out")
+    return (
+      <>
+        {toaster}
+        <Login
+          notice={notice}
+          onDone={() => {
+            setNotice("");
+            setAuth("in");
+          }}
+        />
+      </>
+    );
 
   return (
-    <ErrorBoundary>
-      <MainLayout version={version}>
-        {isAuthenticated ? (
-          // Protected content - only shown when authenticated
-          <Card className="w-full max-w-md sm:max-w-lg md:max-w-xl mx-auto">
-            <TabNavigation
-              tabs={tabs}
-              activeTab={activeTab}
-              onTabChange={(tabId) => setActiveTab(tabId)}
-              className="mb-6"
-            />
+    <>
+      {toaster}
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="brand">
+            <Logo size={28} />
+            <span className="brand-name">ClewdR</span>
+            {version && <span className="brand-ver">{version}</span>}
+          </div>
+          <nav className="nav">
+            {TABS.map((t) => (
+              <button key={t.id} aria-current={tab === t.id ? "page" : undefined} onClick={() => go(t.id)}>
+                {t.label}
+              </button>
+            ))}
+          </nav>
+          <button
+            className="icon-btn"
+            title={theme === "light" ? "切换到夜间" : "切换到白天"}
+            aria-label={theme === "light" ? "切换到夜间" : "切换到白天"}
+            onClick={toggle}
+          >
+            <Icon name={theme === "light" ? "moon" : "sun"} size={18} />
+          </button>
+          <div className="leave">
+            <button
+              className={`icon-btn danger ${leaving ? "armed" : ""}`}
+              title="退出登录"
+              aria-label={leaving ? "再次点击以退出" : "退出登录"}
+              onClick={() => (leaving ? kick("已退出登录") : setLeaving(true))}
+            >
+              <Icon name="logout" size={18} />
+            </button>
+            {leaving && <div className="leave-tip">再次点击以退出</div>}
+          </div>
+        </div>
+      </header>
 
-            <ErrorBoundary>
-              {activeTab === "claude" ? (
-                <ClaudeTabs />
-              ) : activeTab === "config" ? (
-                <ConfigTab />
-              ) : (
-                <LogoutPanel onLogout={handleLogout} />
-              )}
-            </ErrorBoundary>
-          </Card>
-        ) : (
-          // Auth gatekeeper - shown when not authenticated
-          <Card className="w-full max-w-md sm:max-w-lg md:max-w-xl mx-auto">
-            <h2 className="text-xl font-semibold text-center mb-6">
-              {t("auth.title")}
-            </h2>
-
-            {passwordChanged && (
-              <StatusMessage type="info" message={t("auth.passwordChanged")} />
-            )}
-
-            <p className="text-gray-400 text-sm mb-6 text-center">
-              {t("auth.description")}
-            </p>
-
-            <ErrorBoundary>
-              <AuthGatekeeper onAuthenticated={handleAuthenticated} />
-            </ErrorBoundary>
-          </Card>
-        )}
-      </MainLayout>
-    </ErrorBoundary>
+      <main key={tab}>
+        {tab === "accounts" && <Accounts onAuthFail={kick} />}
+        {tab === "watch" && <Monitor />}
+        {tab === "settings" && <Settings onAuthFail={kick} />}
+      </main>
+    </>
   );
 }
-
-export default App;
