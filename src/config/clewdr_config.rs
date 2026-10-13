@@ -27,7 +27,6 @@ use crate::{
         default_max_retries, default_port, default_skip_cool_down, default_use_real_roles,
     },
     error::ClewdrError,
-    utils::enabled,
 };
 
 /// Generates a random password for authentication
@@ -197,58 +196,48 @@ impl Default for ClewdrConfig {
 
 impl Display for ClewdrConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // one line per field
-        let authority = self.address();
-        let authority: Authority = authority.to_string().parse().map_err(|_| std::fmt::Error)?;
-        let api_url = Uri::builder()
-            .scheme(Scheme::HTTP)
-            .authority(authority.to_owned())
-            .path_and_query("/v1")
-            .build()
+        // What a person needs right after starting it: where the panel is and
+        // the two things to paste into the chat client. Only the Claude Code
+        // endpoint is shown, since that is the one logged-in accounts serve.
+        // The address is one a browser on this machine can open, even when the
+        // server was bound to every interface.
+        let host = if self.ip.is_unspecified() {
+            IpAddr::from([127, 0, 0, 1])
+        } else {
+            self.ip
+        };
+        let authority: Authority = SocketAddr::new(host, self.port)
+            .to_string()
+            .parse()
             .map_err(|_| std::fmt::Error)?;
-        let web_url = Uri::builder()
+        let panel = Uri::builder()
             .scheme(Scheme::HTTP)
-            .authority(authority.to_string())
+            .authority(authority)
             .path_and_query("")
             .build()
-            .map_err(|_| std::fmt::Error)?;
+            .map_err(|_| std::fmt::Error)?
+            .to_string();
         write!(
             f,
-            "Claude(Claude and OpenAI format) Endpoint: {}\n\
-            Claude Code(Claude and OpenAI format) Endpoint: {}\n\
-            API Password: {}\n\
-            Web Admin Endpoint: {}\n\
-            Web Admin Password: {}\n",
-            api_url.to_string().green().underline(),
-            (web_url.to_string() + "code/v1").green().underline(),
-            self.password.yellow(),
-            web_url.to_string().green().underline(),
+            "管理面板（用浏览器打开）：{}\n\
+            管理员密钥（登面板用）：{}\n\
+            酒馆里填的反代地址：{}\n\
+            酒馆里填的密码（API 密钥）：{}\n",
+            panel.green().underline(),
             self.admin_password.yellow(),
+            (panel.clone() + "code/v1").green().underline(),
+            self.password.yellow(),
         )?;
         if let Some(ref proxy) = self.proxy {
-            writeln!(f, "Proxy: {}", proxy.to_string().blue())?;
+            writeln!(f, "代理：{}", proxy.to_string().blue())?;
         }
         if let Some(ref rproxy) = self.rproxy {
-            writeln!(f, "Reverse Proxy: {}", rproxy.to_string().blue())?;
+            writeln!(f, "上游地址覆盖：{}", rproxy.to_string().blue())?;
         }
-        writeln!(f, "Skip Free: {}", enabled(self.skip_non_pro))?;
-        writeln!(f, "Skip restricted: {}", enabled(self.skip_restricted))?;
         writeln!(
             f,
-            "Skip second warning: {}",
-            enabled(self.skip_second_warning)
-        )?;
-        writeln!(
-            f,
-            "Skip first warning: {}",
-            enabled(self.skip_first_warning)
-        )?;
-        writeln!(f, "Skip normal Pro: {}", enabled(self.skip_normal_pro))?;
-        writeln!(f, "Skip rate limit: {}", enabled(self.skip_rate_limit))?;
-        writeln!(
-            f,
-            "Web count_tokens: {}",
-            enabled(self.enable_web_count_tokens)
+            "第一次用：打开管理面板 → 账户 → 右上角加号 → 授权登录。\n\
+            反代地址和密码在面板「设置」页最上面也能复制。这个窗口要一直开着。"
         )?;
         Ok(())
     }
@@ -388,7 +377,7 @@ impl ClewdrConfig {
             && let Some(found) = system_proxy()
             && let Ok(proxy) = Proxy::all(found.as_str())
         {
-            println!("Proxy (from the system): {}", found.blue());
+            println!("代理（跟随系统设置）：{}", found.blue());
             self.wreq_proxy = Some(proxy);
         }
         self
