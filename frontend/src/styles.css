@@ -721,6 +721,15 @@ button:disabled {
   height: 32px;
 }
 
+/* 输入框右头并排两个小圆钮（看一眼、复制）时，靠里的那个往左让一格 */
+.input-wrap.two .input {
+  padding-right: 80px;
+}
+
+.input-wrap.two .icon-btn:first-of-type {
+  right: 40px;
+}
+
 /* ───────── 开关 ───────── */
 
 .switch {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AuthError, checkPassword, getConfig, saveConfig, token, type Config } from "../api";
-import { Icon, Switch } from "./ui";
+import { CopyButton, Icon, Switch } from "./ui";
 
 type Field =
   | { key: string; kind: "switch"; title: string; desc?: string }
@@ -59,7 +59,7 @@ const GROUPS: Group[] = [
     icon: "key",
     title: "认证与网络",
     fields: [
-      { key: "password", kind: "secret", title: "API 密钥", desc: "客户端（SillyTavern、Honeypot、aichat）调用接口时使用。" },
+      { key: "password", kind: "secret", title: "API 密钥", desc: "酒馆等客户端调用接口时使用。" },
       { key: "admin_password", kind: "secret", title: "管理员密钥", desc: "用于登录本控制台。修改后，当前浏览器的凭据会同步更新。" },
       {
         key: "proxy",
@@ -130,13 +130,13 @@ const GROUPS: Group[] = [
   {
     icon: "server",
     title: "服务",
-    // 这几项点错一下就断线或被官方版覆盖，改动即时生效之后不再放开关，只显示
-    desc: "监听地址与端口和 nginx 绑定，只能在服务器上修改。",
+    // 这几项点错一下就断线，改动即时生效之后不再放开关，只显示
+    desc: "监听地址与端口要改配置文件并重启程序才生效。",
     fields: [
       { key: "ip", kind: "info", title: "监听地址" },
       { key: "port", kind: "info", title: "端口" },
       { key: "check_update", kind: "switch", title: "检查更新" },
-      { key: "auto_update", kind: "info", title: "自动更新", desc: "当前为定制构建，开启后会被官方版本覆盖。" },
+      { key: "auto_update", kind: "info", title: "自动更新", desc: "启动时发现新版就自己换上，只能在配置文件里开。" },
     ],
   },
 ];
@@ -160,6 +160,44 @@ function Secret({ value, onChange, onBlur }: { value: string; onChange: (v: stri
         <Icon name={show ? "eyeOff" : "eye"} size={16} />
       </button>
     </div>
+  );
+}
+
+// 接到酒馆要填的两样摆在一起：地址按浏览器打开面板的这个地址推出来，密钥就是「API 密钥」那一格的值
+function Connect({ apiKey }: { apiKey: string }) {
+  const [show, setShow] = useState(false);
+  const endpoint = `${window.location.origin}/code/v1`;
+  return (
+    <section className="card group fade-in">
+      <div className="group-head">
+        <h3>
+          <Icon name="link" size={17} />
+          接入酒馆
+        </h3>
+        <p>酒馆里 API 选 Claude，把这两项填进「反向代理」的地址和密码。</p>
+      </div>
+      <div className="row stack">
+        <div className="row-text">
+          <div className="row-title">反代地址</div>
+        </div>
+        <div className="input-wrap">
+          <input className="input mono" readOnly value={endpoint} onFocus={(e) => e.currentTarget.select()} />
+          <CopyButton text={endpoint} title="复制地址" />
+        </div>
+      </div>
+      <div className="row stack">
+        <div className="row-text">
+          <div className="row-title">API 密钥</div>
+        </div>
+        <div className="input-wrap two">
+          <input className="input mono" readOnly type={show ? "text" : "password"} value={apiKey} />
+          <button type="button" className="icon-btn" onClick={() => setShow(!show)} aria-label={show ? "隐藏" : "显示"}>
+            <Icon name={show ? "eyeOff" : "eye"} size={16} />
+          </button>
+          <CopyButton text={apiKey} title="复制密钥" />
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -409,6 +447,7 @@ export default function Settings({ onAuthFail }: { onAuthFail: (notice?: string)
 
       {cfg && (
         <div className="groups">
+          <Connect apiKey={String(cfg.password ?? "")} />
           {GROUPS.map((g) => (
             <section key={g.title} className="card group fade-in">
               <div className="group-head">
