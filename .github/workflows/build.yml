@@ -1,7 +1,7 @@
 name: build
 
 # Builds run for a version tag (which also publishes a release) or by hand.
-# Not on every push: the Windows runner alone costs double minutes.
+# Not on every push: the Windows runner alone bills double minutes.
 on:
   push:
     tags:
