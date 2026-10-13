@@ -1,6 +1,6 @@
 # clewdr 魔改版
 
-把酒馆（SillyTavern）接到自己 Claude 订阅上的反代。基于 [Xerxes-2/clewdr](https://github.com/Xerxes-2/clewdr) v0.12.25，沿用原项目的 AGPL-3.0 许可证。
+把酒馆（SillyTavern）接到自己 Claude 订阅上的反代。基于 [Xerxes-2/clewdr](https://github.com/Xerxes-2/clewdr) v0.12.25，提示词缓存和授权登录的做法移植自 [LeenHawk/gproxy](https://github.com/LeenHawk/gproxy)。两个原项目都是 AGPL-3.0，这里沿用同一许可证。
 
 ## 和原版的区别
 
