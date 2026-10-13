@@ -381,6 +381,131 @@ impl ClewdrConfig {
                 })
                 .ok()
         });
+        // No proxy filled in: follow the one the machine itself is set to use.
+        // A VPN client in "system proxy" mode only announces itself there, and
+        // without this a fresh install talks to upstream directly and is refused.
+        if self.wreq_proxy.is_none()
+            && let Some(found) = system_proxy()
+            && let Ok(proxy) = Proxy::all(found.as_str())
+        {
+            println!("Proxy (from the system): {}", found.blue());
+            self.wreq_proxy = Some(proxy);
+        }
         self
+    }
+}
+
+/// The proxy this machine is configured to use: the usual environment
+/// variables first, then on Windows the system proxy setting.
+fn system_proxy() -> Option<String> {
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(value) = std::env::var(name)
+            && let Some(proxy) = proxy_url(&value)
+        {
+            return Some(proxy);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let read = |value: &str| -> Option<String> {
+            let out = std::process::Command::new("reg")
+                .args([
+                    "query",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    "/v",
+                    value,
+                ])
+                .output()
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find(|line| line.trim_start().starts_with(value))
+                .and_then(|line| line.split_whitespace().last())
+                .map(str::to_owned)
+        };
+        if read("ProxyEnable").as_deref() == Some("0x1") {
+            return read("ProxyServer").and_then(|server| proxy_url(&server));
+        }
+    }
+    None
+}
+
+/// Turns a proxy setting into a URL. Takes a plain `host:port`, a full URL,
+/// or the Windows per-protocol form `http=host:port;https=host:port`.
+fn proxy_url(setting: &str) -> Option<String> {
+    let setting = setting.trim();
+    if setting.is_empty() {
+        return None;
+    }
+    if !setting.contains('=') {
+        return Some(if setting.contains("://") {
+            setting.to_owned()
+        } else {
+            format!("http://{setting}")
+        });
+    }
+    let entries: Vec<(&str, &str)> = setting
+        .split(';')
+        .filter_map(|entry| entry.trim().split_once('='))
+        .collect();
+    let pick = |scheme: &str| {
+        entries
+            .iter()
+            .find(|(name, host)| name.eq_ignore_ascii_case(scheme) && !host.is_empty())
+            .map(|(_, host)| *host)
+    };
+    if let Some(host) = pick("https").or_else(|| pick("http")) {
+        return Some(if host.contains("://") {
+            host.to_owned()
+        } else {
+            format!("http://{host}")
+        });
+    }
+    pick("socks").map(|host| {
+        if host.contains("://") {
+            host.to_owned()
+        } else {
+            format!("socks5://{host}")
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proxy_url;
+
+    #[test]
+    fn a_bare_host_and_port_becomes_an_http_proxy() {
+        assert_eq!(proxy_url("127.0.0.1:7890").as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(proxy_url(" 127.0.0.1:7890 ").as_deref(), Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn a_full_url_is_kept_as_it_is() {
+        assert_eq!(proxy_url("socks5://127.0.0.1:1080").as_deref(), Some("socks5://127.0.0.1:1080"));
+        assert_eq!(proxy_url("http://127.0.0.1:7897").as_deref(), Some("http://127.0.0.1:7897"));
+    }
+
+    #[test]
+    fn the_per_protocol_form_prefers_https_then_http_then_socks() {
+        assert_eq!(
+            proxy_url("http=127.0.0.1:7890;https=127.0.0.1:7891;socks=127.0.0.1:7892").as_deref(),
+            Some("http://127.0.0.1:7891")
+        );
+        assert_eq!(proxy_url("http=127.0.0.1:7890").as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(proxy_url("socks=127.0.0.1:7892").as_deref(), Some("socks5://127.0.0.1:7892"));
+    }
+
+    #[test]
+    fn nothing_usable_means_no_proxy() {
+        assert_eq!(proxy_url(""), None);
+        assert_eq!(proxy_url("ftp=127.0.0.1:21"), None);
     }
 }
