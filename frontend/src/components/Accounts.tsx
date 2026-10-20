@@ -16,9 +16,10 @@ import { CopyButton, Icon, Spinner } from "./ui";
 
 const level = (p: number) => (p >= 90 ? "lvl-hot" : p >= 70 ? "lvl-warn" : "lvl-ok");
 
-function Ring({ pct: raw }: { pct: number }) {
-  // 上游偶尔给 37.5 这种小数，圈里只放整数
-  const pct = Math.round(raw);
+function Ring({ pct: raw }: { pct?: number }) {
+  // 上游偶尔给 37.5 这种小数，圈里只放整数；这一回没查到用量就不写数，放一道横线
+  const known = typeof raw === "number";
+  const pct = typeof raw === "number" ? Math.round(raw) : 0;
   const r = 40;
   const c = 2 * Math.PI * r;
   const [shown, setShown] = useState(0);
@@ -44,10 +45,14 @@ function Ring({ pct: raw }: { pct: number }) {
         />
       </svg>
       <div className="val">
-        <span>
-          {pct}
-          <small>%</small>
-        </span>
+        {known ? (
+          <span>
+            {pct}
+            <small>%</small>
+          </span>
+        ) : (
+          <span style={{ color: "var(--muted)" }}>—</span>
+        )}
       </div>
     </div>
   );
@@ -56,12 +61,14 @@ function Ring({ pct: raw }: { pct: number }) {
 interface MeterData {
   label: string;
   tag?: string;
-  pct: number;
+  // 没有这一项就是这一回没从上游查到用量，和查到了是 0 不一样
+  pct?: number;
   resets?: string | null;
 }
 
 function Meter({ label, tag, pct, resets }: MeterData) {
   const d = toDate(resets);
+  const idle = pct === undefined ? "用量没查到" : pct === 0 ? "尚未计量" : "重置时间未知";
   return (
     <div className="card meter">
       <Ring pct={pct} />
@@ -70,7 +77,7 @@ function Meter({ label, tag, pct, resets }: MeterData) {
           {label}
           {tag && <span className="tag">{tag}</span>}
         </div>
-        <div className="big">{d ? span(d) || "即将重置" : pct === 0 ? "尚未计量" : "重置时间未知"}</div>
+        <div className="big">{d ? span(d) || "即将重置" : idle}</div>
         {d && <div className="foot">{when(d)} 重置</div>}
       </div>
     </div>
@@ -97,8 +104,8 @@ function Stat({ k, u }: { k: string; u?: Usage }) {
 
 function meters(acc: Account): MeterData[] {
   const list: MeterData[] = [
-    { label: "5 小时窗口", pct: acc.session_utilization ?? 0, resets: acc.session_resets_at },
-    { label: "7 天窗口", pct: acc.seven_day_utilization ?? 0, resets: acc.seven_day_resets_at },
+    { label: "5 小时窗口", pct: acc.session_utilization, resets: acc.session_resets_at },
+    { label: "7 天窗口", pct: acc.seven_day_utilization, resets: acc.seven_day_resets_at },
   ];
   for (const s of acc.scoped_limits ?? []) {
     list.push({ label: "7 天窗口", tag: s.name, pct: s.percent, resets: s.resets_at });
@@ -185,14 +192,18 @@ function AccountCard({
     }
   };
 
-  const tone = kind === "valid" ? "tone-ok" : kind === "exhausted" ? "tone-wait" : "tone-bad";
   // 授权登录的账户没有 Cookie 可看可抄，名字显示邮箱，失效了就是登录过期
   const oauth = isOAuth(acc.cookie);
   const loginUntil = oauth ? toDate(acc.oauth_refresh_expires_at ?? null) : null;
+  // 登录已经到期、账户还排在「可用」里：手里的令牌用完就续不上了，不能再写运行正常
+  const loginOver = kind === "valid" && !!loginUntil && loginUntil.getTime() <= Date.now();
+  const tone = loginOver ? "tone-wait" : kind === "valid" ? "tone-ok" : kind === "exhausted" ? "tone-wait" : "tone-bad";
   const okText = oauth
-    ? loginUntil
-      ? `授权登录 · 运行正常 · 登录有效至 ${when(loginUntil)}`
-      : "授权登录 · 运行正常"
+    ? loginOver
+      ? "授权登录 · 登录已到期，重新登录一次即可"
+      : loginUntil
+        ? `授权登录 · 运行正常 · 登录有效至 ${when(loginUntil)}`
+        : "授权登录 · 运行正常"
     : "运行正常";
   const badText = oauth ? "授权已过期，重新登录一次即可" : reasonText(acc.reason);
   const meta = kind === "valid" ? okText : kind === "exhausted" ? cooldown(acc) : badText;
@@ -200,7 +211,7 @@ function AccountCard({
   return (
     <div className="card acc">
       <div className="acc-row">
-        <span className={`dot ${tone} ${kind === "valid" ? "live" : ""}`} />
+        <span className={`dot ${tone} ${kind === "valid" && !loginOver ? "live" : ""}`} />
         <div className="acc-main">
           {oauth ? (
             <div className="acc-key">{accountName(acc)}</div>
@@ -209,7 +220,7 @@ function AccountCard({
               {maskCookie(acc.cookie)}
             </button>
           )}
-          <div className={`acc-meta ${kind === "invalid" ? "tone-bad" : ""}`}>{meta}</div>
+          <div className={`acc-meta ${kind === "invalid" ? "tone-bad" : loginOver ? "tone-wait" : ""}`}>{meta}</div>
         </div>
         <div className="acc-actions">
           {!oauth && (

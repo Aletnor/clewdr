@@ -341,6 +341,7 @@ fn row_json(row: &Value) -> Value {
         "short": short_model(model),
         "real": row.get("real").cloned().unwrap_or(Value::Null),
         "sig": sig,
+        "atis": row.get("atis").cloned().unwrap_or(Value::Null),
         "code": code,
         "ok": !bad,
         "flag": marks.first(),

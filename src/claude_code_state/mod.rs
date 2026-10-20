@@ -1,8 +1,10 @@
+mod atis;
 mod chat;
 mod exchange;
 pub mod oauth_login;
 mod organization;
 mod sigcheck;
+pub use atis::probe as atis_probe;
 pub use sigcheck::record_path;
 use http::{
     HeaderValue, Method,
@@ -35,6 +37,13 @@ pub struct ClaudeCodeState {
     pub system_prompt_hash: Option<u64>,
     pub anthropic_beta_header: Option<String>,
     pub usage: Usage,
+    /// Upstream answered 401 to the token used in the last request. Set by
+    /// `execute_claude_request`, read by `try_chat` to try one refresh before
+    /// the account is given up.
+    pub token_rejected: bool,
+    /// Whether the last request sent upstream carried an atis slot. Set by
+    /// `execute_claude_request`, copied onto the request's record.
+    pub atis_sent: Option<bool>,
 }
 
 impl ClaudeCodeState {
@@ -52,6 +61,8 @@ impl ClaudeCodeState {
             system_prompt_hash: None,
             anthropic_beta_header: None,
             usage: Usage::default(),
+            token_rejected: false,
+            atis_sent: None,
         }
     }
 

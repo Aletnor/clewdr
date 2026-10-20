@@ -181,7 +181,9 @@ function Row({ r, open, toggle, maxOut }: { r: MonitorRow; open: boolean; toggle
           <span className="faint only-d">:{pad(t.getSeconds())}</span>
         </span>
         <span className="c-model">
-          <span className="c-model-name">{r.short}</span>
+          <span className={`c-model-name ${r.atis ? "shunt" : ""}`} title={r.atis ? "已附带分流号" : undefined}>
+            {r.short}
+          </span>
         </span>
         <span className="c-result">
           {badge || r.sig === "bad" ? badges : <span className="rdone">完成</span>}
@@ -285,6 +287,10 @@ function Row({ r, open, toggle, maxOut }: { r: MonitorRow; open: boolean; toggle
                 <dd className="mono">{r.rate} token/s</dd>
               </>
             )}
+            <dt>分流号</dt>
+            <dd className={r.atis == null ? "faint" : ""}>
+              {r.atis == null ? "无记录" : r.atis ? "已附带" : "未附带"}
+            </dd>
             <dt>通道</dt>
             <dd>
               {r.stream ? "流式" : "非流式"} · {r.format ?? "?"}

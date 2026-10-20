@@ -53,6 +53,7 @@ export interface MonitorRow {
   short: string;
   real: string | null;
   sig: "ok" | "bad" | "none";
+  atis: boolean | null;
   code: string | null;
   ok: boolean;
   flag: string | null;
@@ -205,5 +206,28 @@ export async function saveConfig(cfg: Config) {
 // 监控数据由 clewdr 自己从响应记录里数出来
 export async function getMonitor(): Promise<MonitorData> {
   const res = await call("/api/monitor", { cache: "no-store" });
+  return res.json();
+}
+
+export interface GrayModel {
+  model: string;
+  slots: number;
+  asked: number;
+  failed: number;
+  experiment: string | null;
+  flags: string[];
+}
+
+export interface GrayProbe {
+  at: number;
+  tokens: number;
+  expired: number;
+  models: GrayModel[];
+  error?: string;
+}
+
+// 分流探测：逐个账户向上游查询各型号的分流号，结果缓存五分钟，force 为 true 时跳过缓存
+export async function getGray(force = false): Promise<GrayProbe> {
+  const res = await call(force ? "/api/gray?refresh=true" : "/api/gray", { cache: "no-store" });
   return res.json();
 }

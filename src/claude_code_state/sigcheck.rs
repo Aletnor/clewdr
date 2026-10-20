@@ -216,6 +216,9 @@ fn stop_reason_name(reason: &StopReason) -> &'static str {
 struct RecordFields {
     claimed: Option<String>,
     real: Option<String>,
+    /// Whether the request went upstream carrying an atis slot (see
+    /// `atis.rs`). None when it never got as far as being sent.
+    atis: Option<bool>,
     stop: Option<String>,
     detail: Option<String>,
     error: Option<String>,
@@ -319,6 +322,12 @@ impl ResponseRecord {
                 sent: true,
                 ..Default::default()
             }),
+        }
+    }
+
+    pub fn note_atis(&self, carried: bool) {
+        if let Ok(mut f) = self.fields.lock() {
+            f.atis = Some(carried);
         }
     }
 
@@ -486,6 +495,7 @@ impl Drop for ResponseRecord {
             "format": self.format,
             "model": f.claimed,
             "real": f.real,
+            "atis": f.atis,
             "stop": f.stop,
             "ok": ok,
             "cut": cut,

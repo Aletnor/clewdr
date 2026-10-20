@@ -51,7 +51,10 @@ impl ClaudeCodeState {
         // The last account-wide rate limit met on the way, so that when every
         // account turns out to be benched the client hears upstream's own words.
         let mut last_limit: Option<ClewdrError> = None;
-        for i in 0..CLEWDR_CONFIG.load().max_retries + 1 {
+        // The last 529 met on the way, handed to the client if every try ends in one.
+        let mut last_overload: Option<ClewdrError> = None;
+        let max_retries = CLEWDR_CONFIG.load().max_retries;
+        for i in 0..max_retries + 1 {
             if i > 0 {
                 info!("[RETRY] attempt: {}", i.to_string().green());
             }
@@ -92,9 +95,30 @@ impl ClaudeCodeState {
                         msg: "No access token found in cookie",
                     });
                 };
-                state
-                    .send_chat(access_token.access_token.to_owned(), p)
-                    .await
+                let used = access_token.access_token.to_owned();
+                let sent = state.send_chat(used.clone(), p.to_owned()).await;
+                if sent.is_ok() || !state.token_rejected {
+                    return sent;
+                }
+                // Upstream said 401 to a token that is not due yet. It used to
+                // mean the account was written off on the spot. A token can die
+                // early for reasons that a refresh cures (it was rotated
+                // elsewhere, or revoked while the refresh token still stands),
+                // so spend one refresh on it first. Only when the refresh itself
+                // is turned down, or the fresh token is refused too, is the
+                // account given up.
+                state.token_rejected = false;
+                info!("Upstream answered 401 to a token that is not due yet, trying one refresh");
+                state.refresh_rejected_token(&used).await?;
+                let fresh = state
+                    .cookie
+                    .as_ref()
+                    .and_then(|c| c.token.as_ref())
+                    .map(|t| t.access_token.to_owned());
+                match fresh {
+                    Some(fresh) if fresh != used => state.send_chat(fresh, p).await,
+                    _ => sent,
+                }
             }
             .instrument(tracing::info_span!(
                 "claude_code",
@@ -114,6 +138,16 @@ impl ClaudeCodeState {
                         state.return_cookie(Some(reason.to_owned())).await;
                         continue;
                     }
+                    // Upstream being overloaded is nobody's fault here: not the
+                    // account's, not the request's. Wait a little and try again
+                    // instead of handing the 529 straight to the client.
+                    if Self::is_overloaded(&e) && i < max_retries {
+                        let wait = 1500 * (i as u64 + 1);
+                        warn!("Upstream overloaded (529), waiting {wait} ms before another try");
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                        last_overload = Some(e);
+                        continue;
+                    }
                     // A limit on the whole subscription benches the account until
                     // it resets. Any other 429 belongs to one model or one kind of
                     // request: the account stays, the client gets the 429 as it is.
@@ -128,7 +162,14 @@ impl ClaudeCodeState {
                 }
             }
         }
-        Err(last_limit.unwrap_or(ClewdrError::TooManyRetries))
+        Err(last_limit
+            .or(last_overload)
+            .unwrap_or(ClewdrError::TooManyRetries))
+    }
+
+    /// Upstream's "overloaded" answer, the one worth waiting out.
+    fn is_overloaded(error: &ClewdrError) -> bool {
+        matches!(error, ClewdrError::ClaudeHttpError { code, .. } if code.as_u16() == 529)
     }
 
     /// The reset time, when upstream says the limit that was hit covers the
@@ -221,7 +262,15 @@ impl ClaudeCodeState {
             self.anthropic_beta_header.as_deref(),
             use_context_1m,
         );
-        self.client
+        // 面板「分流号」开关关闭时，不查询也不附带分流号
+        let atis = if CLEWDR_CONFIG.load().atis {
+            super::atis::lookup(&self.client, &self.endpoint, access_token, &body.model).await
+        } else {
+            None
+        };
+        self.atis_sent = Some(atis.is_some());
+        let mut request = self
+            .client
             .post(
                 self.endpoint
                     .join("v1/messages")
@@ -231,15 +280,21 @@ impl ClaudeCodeState {
             .bearer_auth(access_token)
             .header(USER_AGENT, CLAUDE_CODE_USER_AGENT)
             .header("anthropic-beta", beta_header)
-            .header("anthropic-version", CLAUDE_API_VERSION)
+            .header("anthropic-version", CLAUDE_API_VERSION);
+        if let Some(atis) = atis.as_deref() {
+            request = request.header(super::atis::ATIS_HEADER, atis);
+        }
+        let response = request
             .json(body)
             .send()
             .await
             .context(WreqSnafu {
                 msg: "Failed to send chat message",
-            })?
-            .check_claude_code()
-            .await
+            })?;
+        // Remember a 401 before the status is folded into `Reason::Null`,
+        // which a refused organisation (403) is folded into as well.
+        self.token_rejected = response.status().as_u16() == 401;
+        response.check_claude_code().await
     }
 
     async fn persist_count_tokens_allowed(&mut self, value: bool) {
@@ -396,6 +451,7 @@ impl ClaudeCodeState {
                     let (resp, _) = Self::materialize_non_stream_response(
                         response,
                         self.api_format.to_string().as_str(),
+                        self.atis_sent,
                     )
                     .await?;
                     return Ok(resp);
@@ -428,7 +484,11 @@ impl ClaudeCodeState {
     ) -> Result<axum::response::Response, ClewdrError> {
         if !self.stream {
             let (resp, usage_pair) =
-                Self::materialize_non_stream_response(response, self.api_format.to_string().as_str())
+                Self::materialize_non_stream_response(
+                    response,
+                    self.api_format.to_string().as_str(),
+                    self.atis_sent,
+                )
                     .await?;
             let (input, output) = usage_pair.unwrap_or((self.usage.input_tokens as u64, 0));
             self.persist_usage_totals(input, output, model_family).await;
@@ -479,6 +539,9 @@ impl ClaudeCodeState {
             output_sum.clone(),
         ));
         record.note_status(upstream_status);
+        if let Some(carried) = self.atis_sent {
+            record.note_atis(carried);
+        }
         let record_on_error = record.clone();
         let stream = response.bytes_stream().eventsource().map_ok(move |event| {
             // accumulate output tokens from message_delta usage if present
@@ -597,6 +660,7 @@ impl ClaudeCodeState {
     async fn materialize_non_stream_response(
         response: wreq::Response,
         format: &str,
+        atis: Option<bool>,
     ) -> Result<(axum::response::Response, Option<(u64, u64)>), ClewdrError> {
         let status = response.status();
         let headers = response.headers().clone();
@@ -604,7 +668,7 @@ impl ClaudeCodeState {
             msg: "Failed to read Claude response body",
         })?;
         let usage = Self::extract_usage_from_bytes(&bytes);
-        Self::inspect_response_bytes(&bytes, format, status.as_u16());
+        Self::inspect_response_bytes(&bytes, format, status.as_u16(), atis);
 
         let mut builder = http::Response::builder().status(status);
         for (key, value) in headers.iter() {
@@ -620,7 +684,7 @@ impl ClaudeCodeState {
         Ok((response, usage))
     }
 
-    fn inspect_response_bytes(bytes: &[u8], format: &str, code: u16) {
+    fn inspect_response_bytes(bytes: &[u8], format: &str, code: u16, atis: Option<bool>) {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return;
         };
@@ -648,6 +712,9 @@ impl ClaudeCodeState {
             token_count("output_tokens"),
         );
         record.note_status(code);
+        if let Some(carried) = atis {
+            record.note_atis(carried);
+        }
         if let Some(usage) = usage {
             record.note_cache_usage(usage);
         }
@@ -1061,5 +1128,32 @@ mod tests {
     fn a_passed_on_rate_limit_keeps_its_status_and_its_words() {
         let response = limited(Some("seven_day_oi")).into_response();
         assert_eq!(response.status().as_u16(), 429);
+    }
+
+    fn upstream(status: u16) -> ClewdrError {
+        ClewdrError::ClaudeHttpError {
+            code: wreq::StatusCode::from_u16(status).expect("a status code"),
+            inner: ClaudeErrorBody {
+                message: serde_json::json!("Overloaded"),
+                r#type: "overloaded_error".to_owned(),
+                code: Some(status),
+            },
+        }
+    }
+
+    #[test]
+    fn only_an_overloaded_upstream_is_waited_out() {
+        assert!(ClaudeCodeState::is_overloaded(&upstream(529)));
+        // A bad request stays bad however often it is sent, and a server
+        // error may have come after the request was already taken in.
+        for status in [400, 404, 500, 503] {
+            assert!(!ClaudeCodeState::is_overloaded(&upstream(status)));
+        }
+        assert!(!ClaudeCodeState::is_overloaded(&limited(Some("five_hour"))));
+    }
+
+    #[test]
+    fn an_overloaded_upstream_reaches_the_client_as_529_when_tries_run_out() {
+        assert_eq!(upstream(529).into_response().status().as_u16(), 529);
     }
 }

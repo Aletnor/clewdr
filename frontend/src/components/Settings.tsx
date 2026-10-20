@@ -1,6 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AuthError, checkPassword, getConfig, saveConfig, token, type Config } from "../api";
-import { CopyButton, Icon, Switch } from "./ui";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import {
+  AuthError,
+  checkPassword,
+  getConfig,
+  getGray,
+  saveConfig,
+  token,
+  type Config,
+  type GrayProbe as GrayProbeData,
+} from "../api";
+import { CopyButton, Icon, Spinner, Switch } from "./ui";
 
 type Field =
   | { key: string; kind: "switch"; title: string; desc?: string }
@@ -83,6 +92,7 @@ const GROUPS: Group[] = [
     icon: "send",
     title: "请求处理",
     fields: [
+      { key: "atis", kind: "switch", title: "分流号", desc: "开启后，为已分配分流号的型号在请求中附带分流号。分流号仅表示账户进入了上游实验，不代表使用了不同的模型。" },
       { key: "max_retries", kind: "number", title: "最大重试次数", min: 0, max: 20 },
       { key: "preserve_chats", kind: "switch", title: "保留网页端会话", desc: "网页通道请求结束后，保留 claude.ai 上的对话记录。" },
       { key: "web_search", kind: "switch", title: "联网搜索", desc: "仅适用于网页通道。" },
@@ -198,6 +208,93 @@ function Connect({ apiKey }: { apiKey: string }) {
         </div>
       </div>
     </section>
+  );
+}
+
+const short = (m: string) => m.replace(/^claude-/, "");
+const expName = (k: string) => k.replace(/^claude_code_/, "").replace(/_experiment$/, "");
+
+// 分流探测：列出上游当前为哪些型号分配了分流号
+function GrayProbe({ onAuthFail }: { onAuthFail: (notice?: string) => void }) {
+  const [data, setData] = useState<GrayProbeData | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const run = useCallback(
+    async (force: boolean) => {
+      setBusy(true);
+      try {
+        const d = await getGray(force);
+        setData(d);
+        setErr(d.error ?? "");
+      } catch (e) {
+        if (e instanceof AuthError) return onAuthFail();
+        setErr(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [onAuthFail],
+  );
+
+  useEffect(() => {
+    run(false);
+  }, [run]);
+
+  const hits = data?.models.filter((m) => m.slots > 0) ?? [];
+  const rest = data?.models.filter((m) => m.slots === 0) ?? [];
+  const failed = data?.models.filter((m) => m.asked === 0 && m.failed > 0).length ?? 0;
+
+  let line = "探测中…";
+  if (err) line = `探测失败：${err}`;
+  else if (data && data.tokens === 0)
+    line = data.expired ? "所有账户的令牌均已过期，发起一次请求刷新令牌后再探测。" : "暂无可用账户。";
+  else if (data) line = `${data.tokens} 个账户${data.expired ? `（${data.expired} 个令牌已过期）` : ""}`;
+
+  return (
+    <div className="row stack gray-probe">
+      <div className="row-head">
+        <div className="row-text">
+          <div className="row-title">分流探测</div>
+          <div className="row-desc">{line}</div>
+        </div>
+        <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => run(true)}>
+          {busy ? <Spinner size={14} /> : <Icon name="refresh" size={14} />}
+          探测
+        </button>
+      </div>
+      {data && data.tokens > 0 && (
+        <>
+          {hits.length ? (
+            <div className="gray-hits">
+              {hits.map((m) => (
+                <div key={m.model} className="gray-hit">
+                  <b>
+                    {short(m.model)}
+                    {data.tokens > 1 && ` · ${m.slots}/${m.asked} 个账户`}
+                  </b>
+                  {m.experiment && <small className="mono">{expName(m.experiment)}</small>}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="gray-rest">当前没有型号被分流。</div>
+          )}
+          {rest.length > 0 && (
+            <div className="gray-rest">
+              未分流：
+              {rest.map((m, i) => (
+                <span key={m.model}>
+                  {short(m.model)}
+                  {i < rest.length - 1 && "、"}
+                </span>
+              ))}
+            </div>
+          )}
+          {failed > 0 && <div className="gray-rest">{failed} 个型号探测失败，请稍后重试。</div>}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -458,7 +555,10 @@ export default function Settings({ onAuthFail }: { onAuthFail: (notice?: string)
                 {g.desc && <p>{g.desc}</p>}
               </div>
               {g.fields.map((f) => (
-                <Row key={f.key} f={f} value={cfg[f.key]} rev={revs[f.key] ?? 0} commit={(v) => commit(f.key, v)} />
+                <Fragment key={f.key}>
+                  <Row f={f} value={cfg[f.key]} rev={revs[f.key] ?? 0} commit={(v) => commit(f.key, v)} />
+                  {f.key === "atis" && <GrayProbe onAuthFail={onAuthFail} />}
+                </Fragment>
               ))}
             </section>
           ))}

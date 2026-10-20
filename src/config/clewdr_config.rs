@@ -140,6 +140,11 @@ pub struct ClewdrConfig {
     #[serde(default = "default_cache_depth")]
     pub cache_at_depth: i64,
 
+    // Carry the upstream atis slot on /v1/messages, can hot reload.
+    // See claude_code_state/atis.rs. Off: requests go out without it.
+    #[serde(default)]
+    pub atis: bool,
+
     // Skip field, can hot reload
     #[serde(skip)]
     pub wreq_proxy: Option<Proxy>,
@@ -188,6 +193,7 @@ impl Default for ClewdrConfig {
             magic_cache: default_cache_on(),
             cache_ttl: None,
             cache_at_depth: default_cache_depth(),
+            atis: false,
             no_fs: false,
             log_to_file: false,
         }
@@ -278,6 +284,7 @@ impl ClewdrConfig {
     /// # Returns
     /// * Config instance
     pub fn new() -> Self {
+        sweep_unfinished_saves(CONFIG_PATH.as_path());
         // Load config from TOML then override with environment variables.
         // Use double underscore "__" to map nested keys.
         let mut config: ClewdrConfig = Figment::from(Toml::file(CONFIG_PATH.as_path()))
@@ -285,6 +292,10 @@ impl ClewdrConfig {
             .extract_lossy()
             .inspect_err(|e| {
                 error!("Failed to load config: {}", e);
+                // From here on an empty config is used and then saved over the
+                // file. Whatever is in the file now (it is there, it just did
+                // not parse) is the only copy of the accounts and keys: keep it.
+                Self::keep_unreadable_copy();
             })
             .unwrap_or_default();
         if let Some(ref f) = Args::try_parse().ok().and_then(|a| a.file) {
@@ -331,6 +342,31 @@ impl ClewdrConfig {
         SocketAddr::new(self.ip, self.port)
     }
 
+    /// Copy a config file that would not parse to `clewdr.toml.broken-<time>`.
+    /// The log is not set up yet when the config is first read, so the notice
+    /// goes to the console as well, next to the start-up banner.
+    fn keep_unreadable_copy() {
+        match keep_copy_of(CONFIG_PATH.as_path()) {
+            Ok(Some(backup)) => {
+                error!(
+                    "The config file could not be read, a copy was kept at {}",
+                    backup.display()
+                );
+                eprintln!(
+                    "配置文件读不出来（格式坏了），这次先用一份空配置启动。\n\
+                    原来的文件另存在：{}\n\
+                    账号和密钥都还在那份文件里，修好格式改回原名就能找回。",
+                    backup.display().to_string().yellow()
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error!("The config file could not be read, and keeping a copy failed: {e}");
+                eprintln!("配置文件读不出来，另存一份也没成功：{e}");
+            }
+        }
+    }
+
     /// Save the configuration to a file
     pub async fn save(&self) -> Result<(), ClewdrError> {
         if self.no_fs {
@@ -343,13 +379,7 @@ impl ClewdrConfig {
         }
         let path = CONFIG_PATH.as_path();
         let data = toml::ser::to_string_pretty(self)?;
-        tokio::fs::write(path, data).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            tokio::fs::set_permissions(path, perms).await?;
-        }
+        write_whole(path, &data).await?;
         Ok(())
     }
 
@@ -382,6 +412,108 @@ impl ClewdrConfig {
         }
         self
     }
+}
+
+/// The name of the file at `path`, with something put before and after it.
+fn beside(path: &std::path::Path, before: &str, after: &str) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("clewdr.toml");
+    path.with_file_name(format!("{before}{name}{after}"))
+}
+
+/// Replace the file at `path` with `data`, either whole or not at all.
+///
+/// The text goes into a file next to it, is flushed to disk, and is then
+/// swapped in. Writing straight into the file empties it first: cut off
+/// there (disk full, process killed) and what is left is an empty or half
+/// config, accounts and keys gone.
+async fn write_whole(path: &std::path::Path, data: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = beside(path, ".", &format!(".{}.{seq}.tmp", std::process::id()));
+    let written = async {
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await?;
+        }
+        file.write_all(data.as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    written
+}
+
+/// The files next to `path` whose names start with `prefix`.
+fn siblings(path: &std::path::Path, prefix: &str) -> Vec<std::path::PathBuf> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Remove what a save left behind when the program was stopped in the
+/// middle of one. Those files were never swapped in, so nothing reads them.
+fn sweep_unfinished_saves(path: &std::path::Path) {
+    let prefix = beside(path, ".", ".");
+    let Some(prefix) = prefix.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    for left in siblings(path, prefix) {
+        if left.extension().is_some_and(|e| e == "tmp") {
+            let _ = std::fs::remove_file(left);
+        }
+    }
+}
+
+/// Copy the file at `path` to `<name>.broken-<time>` next to it and say
+/// where it went. A file that is missing or empty has nothing worth keeping,
+/// and a file that was already copied is not copied again, so a program that
+/// keeps being restarted on the same bad file does not fill the disk.
+fn keep_copy_of(path: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > 0 => {}
+        _ => return Ok(None),
+    }
+    let text = std::fs::read(path)?;
+    let marker = beside(path, "", ".broken-");
+    if let Some(marker) = marker.file_name().and_then(|n| n.to_str())
+        && let Some(same) = siblings(path, marker)
+            .into_iter()
+            .find(|kept| std::fs::read(kept).is_ok_and(|kept| kept == text))
+    {
+        return Ok(Some(same));
+    }
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let backup = beside(path, "", &format!(".broken-{stamp}"));
+    // It holds the accounts and keys, so it is the owner's alone from the start.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    std::io::Write::write_all(&mut options.open(&backup)?, &text)?;
+    Ok(Some(backup))
 }
 
 /// The proxy this machine is configured to use: the usual environment
@@ -468,7 +600,111 @@ fn proxy_url(setting: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::proxy_url;
+    use super::{keep_copy_of, proxy_url, sweep_unfinished_saves, write_whole};
+
+    /// An empty directory of its own for one test.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("clewdr-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("a readable directory")
+            .map(|e| e.expect("an entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_save_swaps_the_whole_file_in_and_leaves_nothing_behind() {
+        let dir = scratch("swap");
+        let path = dir.join("clewdr.toml");
+        std::fs::write(&path, "old = true\n").unwrap();
+        write_whole(&path, "new = true\n").await.unwrap();
+        write_whole(&path, "newer = true\n").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer = true\n");
+        assert_eq!(names_in(&dir), ["clewdr.toml"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_save_that_cannot_finish_leaves_what_was_there() {
+        let dir = scratch("stuck");
+        // Something a file cannot be swapped over: a directory that is not empty.
+        let path = dir.join("clewdr.toml");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("kept"), "still here").unwrap();
+        assert!(write_whole(&path, "new = true\n").await.is_err());
+        assert_eq!(names_in(&dir), ["clewdr.toml"]);
+        assert_eq!(std::fs::read_to_string(path.join("kept")).unwrap(), "still here");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_would_not_parse_is_copied_before_it_is_written_over() {
+        let dir = scratch("broken");
+        let path = dir.join("clewdr.toml");
+        assert_eq!(keep_copy_of(&path).unwrap(), None);
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(keep_copy_of(&path).unwrap(), None);
+        std::fs::write(&path, "cookie_array = [ this is not toml").unwrap();
+        let copy = keep_copy_of(&path).unwrap().expect("a copy");
+        let name = copy.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("clewdr.toml.broken-"), "{name}");
+        assert_eq!(
+            std::fs::read_to_string(&copy).unwrap(),
+            "cookie_array = [ this is not toml"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copy).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Restarted again and again on the same bad file: still one copy.
+        assert_eq!(keep_copy_of(&path).unwrap(), Some(copy.clone()));
+        assert_eq!(names_in(&dir), ["clewdr.toml".to_owned(), name]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_a_stopped_save_left_behind_is_swept_and_nothing_else() {
+        let dir = scratch("sweep");
+        let path = dir.join("clewdr.toml");
+        for name in [
+            "clewdr.toml",
+            ".clewdr.toml.4242.0.tmp",
+            ".clewdr.toml.4242.17.tmp",
+            "clewdr.toml.broken-20261013-000000",
+            "clewdr.toml.bak",
+            ".other.toml.1.0.tmp",
+            "notes.tmp",
+        ] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        sweep_unfinished_saves(&path);
+        assert_eq!(
+            names_in(&dir),
+            [
+                ".other.toml.1.0.tmp",
+                "clewdr.toml",
+                "clewdr.toml.bak",
+                "clewdr.toml.broken-20261013-000000",
+                "notes.tmp",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_bare_host_and_port_becomes_an_http_proxy() {

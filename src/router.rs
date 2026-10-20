@@ -103,6 +103,7 @@ impl RouterBuilder {
             )
             .route("/oauth/start", post(api_oauth_start))
             .route("/oauth/finish", post(api_oauth_finish))
+            .route("/gray", get(api_gray))
             .with_state(self.cookie_actor_handle.to_owned());
         let admin_router = Router::new()
             .route("/auth", get(api_auth))

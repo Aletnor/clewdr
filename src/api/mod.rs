@@ -2,9 +2,11 @@ mod claude_code;
 mod claude_web;
 mod config;
 mod error;
+mod gray;
 mod misc;
 mod monitor;
 pub use claude_code::{api_claude_code, api_claude_code_count_tokens};
+pub use gray::api_gray;
 pub use monitor::api_monitor;
 /// Message handling endpoints for creating and managing chat conversations
 pub use claude_web::api_claude_web;

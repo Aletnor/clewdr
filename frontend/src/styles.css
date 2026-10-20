@@ -1755,6 +1755,12 @@ div.acc-key:hover {
   white-space: nowrap;
 }
 
+/* 附带分流号的请求，型号名显示为主色 */
+.c-model-name.shunt {
+  color: var(--honey-text);
+  font-weight: 700;
+}
+
 .c-result {
   display: flex;
   flex-wrap: wrap;
@@ -2115,14 +2121,16 @@ div.acc-key:hover {
 
   .rbadge {
     height: 18px;
-    padding: 0 5px;
+    padding: 0 4px;
     font-size: 10.5px;
   }
 
   .c-result {
     flex-wrap: nowrap;
+    gap: 3px;
     overflow: hidden;
   }
+
 
   .rdone,
   .rstage {
@@ -2224,4 +2232,58 @@ div.acc-key:hover {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* 设置页的分流探测 */
+.gray-probe .row-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.gray-probe .btn {
+  flex: none;
+  height: 32px;
+  padding: 0 14px;
+  font-size: 13px;
+}
+
+.gray-hits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.gray-hit {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: rgba(var(--honey-rgb), 0.12);
+  border: 1px solid rgba(var(--honey-rgb), 0.3);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.gray-hit b {
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--honey-text);
+}
+
+.gray-hit small {
+  font-size: 11.5px;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+
+.gray-rest {
+  font-size: 12.5px;
+  color: var(--dim);
+  line-height: 1.6;
+}
+
+.gray-rest span {
+  white-space: nowrap;
 }

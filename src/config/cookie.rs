@@ -210,14 +210,12 @@ impl CookieStatus {
             && t < chrono::Utc::now().timestamp()
         {
             info!("Cookie reset time expired");
-            return Self {
+            let mut back = Self {
                 reset_time: None,
-                session_usage: UsageBreakdown::default(),
-                weekly_usage: UsageBreakdown::default(),
-                weekly_sonnet_usage: UsageBreakdown::default(),
-                weekly_opus_usage: UsageBreakdown::default(),
                 ..self
             };
+            back.reset_window_usage();
+            return back;
         }
         self
     }
@@ -244,12 +242,27 @@ impl CookieStatus {
         self.count_tokens_allowed = value;
     }
 
+    /// Called when the account goes into a cooldown and when it comes out.
+    ///
+    /// A window whose own reset time is known keeps its count: it is cleared
+    /// when that time comes, which is the only moment upstream clears it.
+    /// Clearing everything here meant a five hour cooldown wiped the weekly
+    /// count twice, once going in and once coming out. Only a window with no
+    /// known reset time is still cleared here, having no other moment for it.
     pub fn reset_window_usage(&mut self) {
-        // Legacy window counters removed; reset session buckets conservatively
-        self.session_usage = UsageBreakdown::default();
-        self.weekly_usage = UsageBreakdown::default();
-        self.weekly_sonnet_usage = UsageBreakdown::default();
-        self.weekly_opus_usage = UsageBreakdown::default();
+        let untracked = |has_reset: Option<bool>| has_reset != Some(true);
+        if untracked(self.session_has_reset) {
+            self.session_usage = UsageBreakdown::default();
+        }
+        if untracked(self.weekly_has_reset) {
+            self.weekly_usage = UsageBreakdown::default();
+        }
+        if untracked(self.weekly_sonnet_has_reset) {
+            self.weekly_sonnet_usage = UsageBreakdown::default();
+        }
+        if untracked(self.weekly_opus_has_reset) {
+            self.weekly_opus_usage = UsageBreakdown::default();
+        }
     }
 
     // ------------------------
@@ -521,5 +534,61 @@ mod tests {
     fn test_invalid_cookie() {
         let result = ClewdrCookie::from_str("invalid-cookie");
         assert!(result.is_err());
+    }
+
+    fn counted(n: u64) -> UsageBreakdown {
+        UsageBreakdown {
+            total_input_tokens: n,
+            total_output_tokens: n,
+            ..Default::default()
+        }
+    }
+
+    fn in_use() -> CookieStatus {
+        CookieStatus {
+            session_usage: counted(5),
+            weekly_usage: counted(7),
+            weekly_sonnet_usage: counted(3),
+            weekly_opus_usage: counted(4),
+            lifetime_usage: counted(100),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cooldown_does_not_wipe_a_window_that_has_its_own_reset_time() {
+        let mut cookie = CookieStatus {
+            session_has_reset: Some(true),
+            weekly_has_reset: Some(true),
+            weekly_sonnet_has_reset: Some(false),
+            weekly_opus_has_reset: None,
+            ..in_use()
+        };
+        // Going into the cooldown.
+        cookie.reset_window_usage();
+        assert_eq!(cookie.session_usage.total_input_tokens, 5);
+        assert_eq!(cookie.weekly_usage.total_output_tokens, 7);
+        // No reset time known for these two, so this is their only clearing.
+        assert_eq!(cookie.weekly_sonnet_usage.total_input_tokens, 0);
+        assert_eq!(cookie.weekly_opus_usage.total_input_tokens, 0);
+        assert_eq!(cookie.lifetime_usage.total_input_tokens, 100);
+
+        // Coming out of it.
+        cookie.reset_time = Some(chrono::Utc::now().timestamp() - 10);
+        let cookie = cookie.reset();
+        assert_eq!(cookie.reset_time, None);
+        assert_eq!(cookie.session_usage.total_input_tokens, 5);
+        assert_eq!(cookie.weekly_usage.total_output_tokens, 7);
+        assert_eq!(cookie.lifetime_usage.total_input_tokens, 100);
+    }
+
+    #[test]
+    fn a_cooldown_still_running_changes_nothing() {
+        let mut cookie = in_use();
+        cookie.reset_time = Some(chrono::Utc::now().timestamp() + 3600);
+        let cookie = cookie.reset();
+        assert!(cookie.reset_time.is_some());
+        assert_eq!(cookie.session_usage.total_input_tokens, 5);
+        assert_eq!(cookie.weekly_usage.total_input_tokens, 7);
     }
 }

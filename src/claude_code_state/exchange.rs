@@ -286,6 +286,41 @@ impl ClaudeCodeState {
         result
     }
 
+    /// Upstream answered 401 to `rejected`, a token that is not due yet.
+    /// Get a new one whatever the expiry says. If somebody else has already
+    /// swapped the token while we were waiting for the lock, that one is taken
+    /// and no refresh is spent.
+    pub async fn refresh_rejected_token(&mut self, rejected: &str) -> Result<(), ClewdrError> {
+        let _guard = REFRESH_LOCK.lock().await;
+        self.adopt_stored_token().await;
+        let current = self
+            .cookie
+            .as_ref()
+            .and_then(|c| c.token.as_ref())
+            .map(|t| t.access_token.as_str());
+        if current.is_some_and(|t| t != rejected) {
+            return Ok(());
+        }
+        // The refresh functions skip a token they think is still good, so
+        // mark this one as run out first.
+        if let Some(token) = self.cookie.as_mut().and_then(|c| c.token.as_mut()) {
+            token.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        }
+        let result = if self
+            .cookie
+            .as_ref()
+            .is_some_and(|c| c.cookie.is_oauth_login())
+        {
+            self.refresh_oauth_login().await
+        } else {
+            self.refresh_cookie_token().await
+        };
+        if result.is_ok() {
+            self.return_cookie(None).await;
+        }
+        result
+    }
+
     /// Take the stored token when it is newer than the one in this snapshot.
     async fn adopt_stored_token(&mut self) {
         let Some(mine) = self.cookie.as_mut() else {
