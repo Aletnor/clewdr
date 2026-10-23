@@ -50,7 +50,7 @@ pub async fn api_update_apply() -> Result<Json<Value>, ApiError> {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        use tracing::{info, warn};
+        use tracing::info;
 
         use crate::services::{busy, update::ClewdrUpdater};
 
@@ -102,15 +102,13 @@ pub async fn api_update_apply() -> Result<Json<Value>, ApiError> {
                 return Err(e);
             }
         };
-        // 先把响应发回面板，再重启。重启失败时旧版本继续运行，闸门重新打开
+        // 先把响应发回面板，再请 main 关掉服务器、换成新程序。闸门保持关闭：
+        // 服务器正在关闭，之后的请求由新程序接
         let installed = version.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             info!("Restarting into version {installed}");
-            let e = ClewdrUpdater::restart(&exe);
-            warn!("Restart failed: {e}");
-            println!("更新已安装，但未能自动重启（{e}）。当前仍在运行旧版本，请手动重新打开程序。");
-            abort();
+            crate::services::update::request_restart(exe);
         });
         Ok(Json(json!({ "version": version })))
     }

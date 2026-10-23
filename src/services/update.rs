@@ -51,6 +51,27 @@ const FORK_OWNER: &str = "Aletnor";
 /// Set on the process started by [`ClewdrUpdater::restart`]
 pub const RESTART_ENV: &str = "CLEWDR_RESTARTED";
 
+static RESTART_INTO: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+static RESTART_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Asks `main` to shut the server down and restart into `exe`. The shutdown
+/// closes the listener and every connection first, so the next process
+/// finds the port free and inherits no sockets.
+pub fn request_restart(exe: PathBuf) {
+    *RESTART_INTO.lock().unwrap_or_else(|e| e.into_inner()) = Some(exe);
+    RESTART_NOTIFY.notify_one();
+}
+
+/// Resolves once [`request_restart`] was called.
+pub async fn restart_requested() {
+    RESTART_NOTIFY.notified().await;
+}
+
+/// The program to restart into, if a restart was requested.
+pub fn pending_restart() -> Option<PathBuf> {
+    RESTART_INTO.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// `clewdr.toml` → `clewdr.toml.bak-v0.12.29`, in the same folder
 fn config_backup_path(config: &Path, version: &str) -> PathBuf {
     let name = config

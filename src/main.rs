@@ -149,16 +149,53 @@ async fn main() -> Result<(), ClewdrError> {
     // create a TCP listener
     let addr = CLEWDR_CONFIG.load().address();
     let listener = bind(addr).await?;
+    #[cfg(windows)]
+    keep_listener_private(&listener);
     let router = clewdr::router::RouterBuilder::new()
         .await
         .with_default_setup()
         .build();
     // serve the application
-    Ok(axum::serve(listener, router)
+    axum::serve(listener, router)
         .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl-C handler");
+            let ctrl_c = async {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("Failed to install Ctrl-C handler");
+            };
+            #[cfg(feature = "portable")]
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = clewdr::services::update::restart_requested() => {}
+            }
+            #[cfg(not(feature = "portable"))]
+            ctrl_c.await;
         })
-        .await?)
+        .await?;
+    // An in-panel update ends here: the listener and every connection are
+    // closed by now, so nothing of this process is left for the next one to
+    // inherit, and the port is free for it.
+    #[cfg(feature = "portable")]
+    if let Some(exe) = clewdr::services::update::pending_restart() {
+        let e = clewdr::services::update::ClewdrUpdater::restart(&exe);
+        eprintln!("更新已安装，但未能自动重启（{e}），请手动重新打开程序。");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Windows sockets can be inherited by child processes. The self-replace
+/// helper and the restarted program would both end up holding this
+/// listener, and the new program could never bind the port.
+#[cfg(windows)]
+fn keep_listener_private(listener: &tokio::net::TcpListener) {
+    use std::os::windows::io::AsRawSocket;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: isize, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+    unsafe {
+        SetHandleInformation(listener.as_raw_socket() as isize, HANDLE_FLAG_INHERIT, 0);
+    }
 }
