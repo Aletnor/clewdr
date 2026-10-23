@@ -35,6 +35,7 @@ impl RouterBuilder {
         let cookie_handle = CookieActorHandle::start()
             .await
             .expect("Failed to start CookieActor");
+        crate::claude_code_state::spawn_token_keepalive(cookie_handle.clone());
         let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone());
         RouterBuilder {
             claude_providers,
@@ -108,6 +109,7 @@ impl RouterBuilder {
         let admin_router = Router::new()
             .route("/auth", get(api_auth))
             .route("/monitor", get(api_monitor))
+            .route("/update", get(api_update_status).post(api_update_apply))
             .route("/config", get(api_get_config).post(api_post_config));
         let router = Router::new()
             .nest(

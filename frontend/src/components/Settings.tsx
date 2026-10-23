@@ -1,13 +1,17 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import {
   AuthError,
+  applyUpdate,
   checkPassword,
   getConfig,
   getGray,
+  getUpdate,
+  getVersion,
   saveConfig,
   token,
   type Config,
   type GrayProbe as GrayProbeData,
+  type UpdateInfo,
 } from "../api";
 import { CopyButton, Icon, Spinner, Switch } from "./ui";
 
@@ -145,8 +149,6 @@ const GROUPS: Group[] = [
     fields: [
       { key: "ip", kind: "info", title: "监听地址" },
       { key: "port", kind: "info", title: "端口" },
-      { key: "check_update", kind: "switch", title: "检查更新" },
-      { key: "auto_update", kind: "info", title: "自动更新", desc: "启动时发现新版就自己换上，只能在配置文件里开。" },
     ],
   },
 ];
@@ -293,6 +295,123 @@ function GrayProbe({ onAuthFail }: { onAuthFail: (notice?: string) => void }) {
           )}
           {failed > 0 && <div className="gray-rest">{failed} 个型号探测失败，请稍后重试。</div>}
         </>
+      )}
+    </div>
+  );
+}
+
+// 发布说明中「## 本版更新」一节的条目；没有这一节时不显示说明
+const releaseItems = (notes = "") => {
+  const m = notes.match(/##\s*本版更新[^\n]*\n([\s\S]*?)(?=\n##\s|$)/);
+  if (!m) return [];
+  return m[1]
+    .split("\n")
+    .map((l) => l.replace(/^\s*[-*]\s*/, "").trim())
+    .filter(Boolean);
+};
+
+// 版本与在线更新：只在点击「检查更新」时查询，是否安装由用户决定
+function UpdateRow({ onAuthFail }: { onAuthFail: (notice?: string) => void }) {
+  const [info, setInfo] = useState<UpdateInfo | null>(null);
+  const [checked, setChecked] = useState(false);
+  const [busy, setBusy] = useState<"" | "check" | "apply">("");
+  const [phase, setPhase] = useState<"" | "restarting" | "stuck">("");
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    getUpdate()
+      .then(setInfo)
+      .catch((e) => e instanceof AuthError && onAuthFail());
+  }, [onAuthFail]);
+
+  const fail = (e: unknown) => {
+    if (e instanceof AuthError) return onAuthFail();
+    setErr(e instanceof Error ? e.message : String(e));
+  };
+
+  const check = async () => {
+    setBusy("check");
+    setErr("");
+    try {
+      setInfo(await getUpdate(true));
+      setChecked(true);
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const apply = async () => {
+    setBusy("apply");
+    setErr("");
+    let version: string;
+    try {
+      version = (await applyUpdate()).version;
+    } catch (e) {
+      setBusy("");
+      return fail(e);
+    }
+    setPhase("restarting");
+    // 等新版本起来后刷新页面；一分钟内没有起来则提示手动重启
+    const deadline = Date.now() + 60_000;
+    const wait = async () => {
+      try {
+        if ((await getVersion()).replace(/^v/, "") === version) return location.reload();
+      } catch {
+        /* 程序重启中 */
+      }
+      if (Date.now() > deadline) {
+        setPhase("stuck");
+        setBusy("");
+        return;
+      }
+      window.setTimeout(wait, 1500);
+    };
+    window.setTimeout(wait, 1500);
+  };
+
+  const current = info ? `v${info.current}` : "";
+  let line = current ? `当前版本 ${current}` : "读取中…";
+  if (info && !info.supported) line = `当前版本 ${current}。此构建不包含在线更新。`;
+  else if (phase === "restarting") line = "正在重启，完成后页面将自动刷新。";
+  else if (phase === "stuck") line = "程序未能自动重启，请手动重新打开 ClewdR。";
+  else if (err) line = err;
+  else if (checked && info?.available) line = `当前版本 ${current}，可更新至 v${info.latest}。`;
+  else if (checked) line = `当前版本 ${current}，已是最新版本。`;
+
+  const items = releaseItems(info?.notes);
+  const offer = checked && info?.available && phase === "";
+
+  return (
+    <div className="row stack update-row">
+      <div className="row-head">
+        <div className="row-text">
+          <div className="row-title">版本</div>
+          <div className="row-desc">{line}</div>
+        </div>
+        {info?.supported && phase === "" && (
+          <button type="button" className="btn btn-ghost" disabled={!!busy} onClick={check}>
+            {busy === "check" ? <Spinner size={14} /> : <Icon name="refresh" size={14} />}
+            检查更新
+          </button>
+        )}
+      </div>
+      {offer && (
+        <div className="update-offer">
+          {items.length > 0 && (
+            <ul className="update-notes">
+              {items.map((t, i) => (
+                <li key={i}>{t}</li>
+              ))}
+            </ul>
+          )}
+          <p className="update-safe">更新仅替换程序文件，账户、令牌、用量与设置保持不变；更新前会在配置文件旁另存一份备份。</p>
+          <button type="button" className="btn btn-primary" disabled={!!busy} onClick={apply}>
+            {busy === "apply" ? <Spinner size={14} /> : <Icon name="refresh" size={14} />}
+            {busy === "apply" ? "正在更新…" : `更新到 v${info?.latest}`}
+          </button>
+        </div>
       )}
     </div>
   );
@@ -558,6 +677,7 @@ export default function Settings({ onAuthFail }: { onAuthFail: (notice?: string)
                 <Fragment key={f.key}>
                   <Row f={f} value={cfg[f.key]} rev={revs[f.key] ?? 0} commit={(v) => commit(f.key, v)} />
                   {f.key === "atis" && <GrayProbe onAuthFail={onAuthFail} />}
+                  {f.key === "port" && <UpdateRow onAuthFail={onAuthFail} />}
                 </Fragment>
               ))}
             </section>

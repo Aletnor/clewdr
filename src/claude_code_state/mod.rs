@@ -1,10 +1,12 @@
 mod atis;
 mod chat;
 mod exchange;
+mod keepalive;
 pub mod oauth_login;
 mod organization;
 mod sigcheck;
 pub use atis::probe as atis_probe;
+pub use keepalive::spawn as spawn_token_keepalive;
 pub use sigcheck::record_path;
 use http::{
     HeaderValue, Method,

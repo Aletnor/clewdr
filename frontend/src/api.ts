@@ -226,6 +226,26 @@ export interface GrayProbe {
   error?: string;
 }
 
+export interface UpdateInfo {
+  current: string;
+  supported: boolean;
+  latest?: string;
+  available?: boolean;
+  notes?: string;
+}
+
+// 版本与在线更新：check 为 true 时才查询 GitHub 上的最新版本
+export async function getUpdate(check = false): Promise<UpdateInfo> {
+  const res = await call(check ? "/api/update?check=true" : "/api/update", { cache: "no-store" });
+  return res.json();
+}
+
+// 安装最新版本，成功后程序自动重启
+export async function applyUpdate(): Promise<{ version: string }> {
+  const res = await call("/api/update", { method: "POST" });
+  return res.json();
+}
+
 // 分流探测：逐个账户向上游查询各型号的分流号，结果缓存五分钟，force 为 true 时跳过缓存
 export async function getGray(force = false): Promise<GrayProbe> {
   const res = await call(force ? "/api/gray?refresh=true" : "/api/gray", { cache: "no-store" });

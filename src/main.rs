@@ -39,6 +39,30 @@ where
     tracing::subscriber::set_global_default(subscriber).expect("unable to set global subscriber");
 }
 
+/// Binds the listening port. After an in-place update the previous process
+/// may still be holding it for a moment, so a restarted process keeps trying
+/// for up to ten seconds.
+async fn bind(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    #[cfg(feature = "portable")]
+    let tries = if std::env::var_os(clewdr::services::update::RESTART_ENV).is_some() {
+        50
+    } else {
+        1
+    };
+    #[cfg(not(feature = "portable"))]
+    let tries = 1;
+    let mut attempt = 1;
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < tries => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Application entry point
 /// Sets up logging, checks for updates, initializes the application state,
 /// creates the router, and starts the server
@@ -124,7 +148,7 @@ async fn main() -> Result<(), ClewdrError> {
     // build axum router
     // create a TCP listener
     let addr = CLEWDR_CONFIG.load().address();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = bind(addr).await?;
     let router = clewdr::router::RouterBuilder::new()
         .await
         .with_default_setup()

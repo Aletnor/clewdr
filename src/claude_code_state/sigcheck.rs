@@ -262,6 +262,9 @@ pub struct ResponseRecord {
     reply_units: AtomicU64,
     timed: bool,
     fields: Mutex<RecordFields>,
+    /// A streamed reply is still being written while this lives, well after
+    /// the handler that started it has returned.
+    _busy: crate::services::busy::Busy,
 }
 
 /// Measures a chunk and forgets it. The tokenizer is not the one upstream
@@ -302,6 +305,7 @@ impl ResponseRecord {
             reply_units: AtomicU64::new(0),
             timed: true,
             fields: Mutex::new(RecordFields::default()),
+            _busy: Default::default(),
         }
     }
 
@@ -322,6 +326,7 @@ impl ResponseRecord {
                 sent: true,
                 ..Default::default()
             }),
+            _busy: Default::default(),
         }
     }
 

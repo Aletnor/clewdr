@@ -5,9 +5,11 @@ mod error;
 mod gray;
 mod misc;
 mod monitor;
+mod update;
 pub use claude_code::{api_claude_code, api_claude_code_count_tokens};
 pub use gray::api_gray;
 pub use monitor::api_monitor;
+pub use update::{api_update_apply, api_update_status};
 /// Message handling endpoints for creating and managing chat conversations
 pub use claude_web::api_claude_web;
 /// Configuration related endpoints for retrieving and updating Clewdr settings

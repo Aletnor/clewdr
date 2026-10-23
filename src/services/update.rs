@@ -2,6 +2,7 @@ use std::{
     env,
     fs::File,
     io::{BufReader, copy},
+    path::{Path, PathBuf},
 };
 
 use colored::Colorize;
@@ -14,14 +15,28 @@ use zip::ZipArchive;
 
 use crate::{
     Args,
-    config::CLEWDR_CONFIG,
+    config::{CLEWDR_CONFIG, CONFIG_PATH},
     error::{ClewdrError, WreqSnafu},
 };
 
 #[derive(Debug, Deserialize)]
-struct GitHubRelease {
+pub struct GitHubRelease {
     tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
     assets: Vec<GitHubAsset>,
+}
+
+impl GitHubRelease {
+    /// Version number without the leading `v`
+    pub fn version(&self) -> &str {
+        self.tag_name.trim_start_matches('v')
+    }
+
+    /// Release notes as written on the release page
+    pub fn notes(&self) -> &str {
+        self.body.as_deref().unwrap_or("")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +47,18 @@ struct GitHubAsset {
 
 /// GitHub account whose `clewdr` repository holds this fork's releases.
 const FORK_OWNER: &str = "Aletnor";
+
+/// Set on the process started by [`ClewdrUpdater::restart`]
+pub const RESTART_ENV: &str = "CLEWDR_RESTARTED";
+
+/// `clewdr.toml` → `clewdr.toml.bak-v0.12.29`, in the same folder
+fn config_backup_path(config: &Path, version: &str) -> PathBuf {
+    let name = config
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("clewdr.toml");
+    config.with_file_name(format!("{name}.bak-v{version}"))
+}
 
 /// Updater for the ClewdR application
 /// Handles checking for updates and updating the application
@@ -54,14 +81,19 @@ impl ClewdrUpdater {
         let repo_owner = FORK_OWNER;
         let repo_name = env!("CARGO_PKG_NAME");
         let policy = wreq::redirect::Policy::default();
-        // A machine that cannot reach GitHub must not hang at startup over this.
-        let client = wreq::Client::builder()
+        // A machine that cannot reach GitHub must not hang over this.
+        let mut builder = wreq::Client::builder()
             .redirect(policy)
-            .timeout(std::time::Duration::from_secs(8))
-            .build()
-            .context(WreqSnafu {
-                msg: "Failed to create HTTP client",
-            })?;
+            .timeout(std::time::Duration::from_secs(8));
+        // GitHub is reached the way upstream is: through the outbound proxy
+        // from the panel, or the system proxy picked up at startup. Without
+        // it a machine behind a VPN in system-proxy mode goes out directly.
+        if let Some(proxy) = CLEWDR_CONFIG.load().wreq_proxy.to_owned() {
+            builder = builder.proxy(proxy);
+        }
+        let client = builder.build().context(WreqSnafu {
+            msg: "Failed to create HTTP client",
+        })?;
 
         let user_agent = format!(
             "clewdr/{} (+https://github.com/{}/{})",
@@ -78,26 +110,40 @@ impl ClewdrUpdater {
         })
     }
 
-    /// Checks for updates by comparing the current version to the latest release on GitHub
-    /// Performs automatic update if enabled in config or explicitly requested
-    ///
-    /// # Returns
-    /// * `Result<bool, ClewdrError>` - True if update available, false otherwise
+    /// Update from the command line (`--update`): install the latest release
+    /// if it is newer, then exit so the user starts the new version.
+    /// Without the flag nothing is checked at startup; checking and installing
+    /// are left to the user, from the panel.
     pub async fn check_for_updates(&self) -> Result<bool, ClewdrError> {
         if CLEWDR_CONFIG.load().no_fs {
-            // If no_fs feature is enabled, skip update check
             info!("Update check skipped due to no_fs feature");
             return Ok(false);
         }
 
         let args: Args = clap::Parser::parse();
-        if !args.update && !CLEWDR_CONFIG.load().check_update {
+        if !args.update {
             return Ok(false);
         }
 
         info!("Checking for updates...");
-        // info!("User-Agent: {}", self.user_agent);
+        let release = self.latest().await?;
+        let current_version = env!("CARGO_PKG_VERSION");
+        if !Self::is_newer(current_version, release.version())? {
+            info!("Already at the latest version {}", current_version.green());
+            return Ok(false);
+        }
+        info!(
+            "New version {} available (current: {})",
+            release.version().green().italic(),
+            current_version.yellow()
+        );
+        self.install(&release).await?;
+        println!("{}", format!("已更新到 v{}，请重新启动程序。", release.version()).green());
+        std::process::exit(0);
+    }
 
+    /// Fetches the latest release of this fork from GitHub
+    pub async fn latest(&self) -> Result<GitHubRelease, ClewdrError> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/releases/latest",
             self.repo_owner, self.repo_name
@@ -117,41 +163,19 @@ impl ClewdrUpdater {
                 msg: "Fetch latest release from GitHub returned an error",
             })?;
 
-        let release: GitHubRelease = response.json().await.context(WreqSnafu {
+        response.json().await.context(WreqSnafu {
             msg: "Failed to parse GitHub release response",
-        })?;
-        let latest_version = release.tag_name.trim_start_matches('v');
-        let current_version = env!("CARGO_PKG_VERSION");
-
-        let update_available = self.compare_versions(current_version, latest_version)?;
-
-        if !update_available {
-            info!("Already at the latest version {}", current_version.green());
-            return Ok(false);
-        }
-        info!(
-            "New version {} available (current: {})",
-            latest_version.green().italic(),
-            current_version.yellow()
-        );
-        // Auto update if enabled
-        if args.update || CLEWDR_CONFIG.load().auto_update {
-            self.perform_update(&release).await?;
-        }
-
-        Ok(true)
+        })
     }
 
-    /// Performs the update process
-    /// Downloads the appropriate release asset, extracts it, and replaces the current binary
+    /// Installs `release` over the running program, without restarting it.
     ///
-    /// # Arguments
-    /// * `release` - GitHub release information containing assets to download
-    ///
-    /// # Returns
-    /// * `Result<(), ClewdrError>` - Success or error during update process
-    async fn perform_update(&self, release: &GitHubRelease) -> Result<(), ClewdrError> {
-        let latest_version = release.tag_name.trim_start_matches('v');
+    /// Only the program file is replaced. Accounts, tokens, usage and settings
+    /// live in the config file next to it and are left where they are; the
+    /// config is written out once more first, and a copy of it is kept as
+    /// `clewdr.toml.bak-v<current version>` before anything is replaced.
+    pub async fn install(&self, release: &GitHubRelease) -> Result<(), ClewdrError> {
+        let latest_version = release.version();
 
         // Find appropriate asset for this platform
         let asset = self.find_appropriate_asset(release)?;
@@ -238,12 +262,45 @@ impl ClewdrUpdater {
             }
         }
 
+        // The config on disk is brought up to date and copied aside before the
+        // program is touched, so the accounts survive whatever happens next.
+        CLEWDR_CONFIG.load().save().await?;
+        let config_path = CONFIG_PATH.as_path();
+        if config_path.exists() {
+            let backup = config_backup_path(config_path, env!("CARGO_PKG_VERSION"));
+            std::fs::copy(config_path, &backup)?;
+            info!("Config copied to {}", backup.display());
+        }
+
         // Replace the current binary
         self_replace::self_replace(&binary_path)?;
 
-        println!("Successfully updated to version {}", latest_version.green());
-        println!("{}", "Update complete, closing...".green());
-        std::process::exit(0);
+        info!("Updated to version {}", latest_version.green());
+        Ok(())
+    }
+
+    /// Starts the program again from `exe` with the same arguments.
+    ///
+    /// On Unix the running process is replaced in place: same pid, same
+    /// terminal, same service unit, so a shell or systemd sees nothing change.
+    /// On Windows a new process is started on the same console and this one
+    /// exits once it is running; the new one waits for the port to come free.
+    /// Returns only when that failed, with this process still serving.
+    pub fn restart(exe: &Path) -> std::io::Error {
+        let mut command = std::process::Command::new(exe);
+        command.args(env::args_os().skip(1)).env(RESTART_ENV, "1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.exec()
+        }
+        #[cfg(not(unix))]
+        {
+            match command.spawn() {
+                Ok(_) => std::process::exit(0),
+                Err(e) => e,
+            }
+        }
     }
 
     /// Finds the appropriate asset for the current platform and architecture
@@ -305,7 +362,7 @@ impl ClewdrUpdater {
     ///
     /// # Returns
     /// * `Result<bool, ClewdrError>` - True if latest is newer than current, false otherwise
-    fn compare_versions(&self, current: &str, latest: &str) -> Result<bool, ClewdrError> {
+    pub fn is_newer(current: &str, latest: &str) -> Result<bool, ClewdrError> {
         let parse_version = |v: &str| -> Result<(u32, u32, u32), ClewdrError> {
             let vec = v.split('.').collect::<Vec<_>>();
             let [major, minor, patch, ..] = vec.as_slice() else {
@@ -318,5 +375,28 @@ impl ClewdrUpdater {
         let current = parse_version(current)?;
         let latest = parse_version(latest)?;
         Ok(current < latest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_higher_version_counts_as_newer() {
+        assert!(ClewdrUpdater::is_newer("0.12.29", "0.12.30").unwrap());
+        assert!(ClewdrUpdater::is_newer("0.12.29", "0.13.0").unwrap());
+        assert!(!ClewdrUpdater::is_newer("0.12.29", "0.12.29").unwrap());
+        assert!(!ClewdrUpdater::is_newer("0.12.30", "0.12.29").unwrap());
+        assert!(ClewdrUpdater::is_newer("0.12.9", "0.12.10").unwrap());
+    }
+
+    #[test]
+    fn the_config_copy_sits_next_to_the_config() {
+        let p = Path::new("/a/b/clewdr.toml");
+        assert_eq!(
+            config_backup_path(p, "0.12.29"),
+            PathBuf::from("/a/b/clewdr.toml.bak-v0.12.29")
+        );
     }
 }

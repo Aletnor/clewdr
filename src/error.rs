@@ -88,6 +88,8 @@ pub enum ClewdrError {
     BadRequest { msg: &'static str },
     #[snafu(display("Retries exceeded"))]
     TooManyRetries,
+    #[snafu(display("ClewdR 正在更新，请稍后再试。"))]
+    Updating,
     #[snafu(display("EventSource error: {}", source))]
     #[snafu(context(false))]
     EventSourceAxumError {
@@ -223,6 +225,7 @@ impl IntoResponse for ClewdrError {
                 (source.status(), json!(source.body_text()))
             }
             ClewdrError::TooManyRetries => (StatusCode::GATEWAY_TIMEOUT, json!(self.to_string())),
+            ClewdrError::Updating => (StatusCode::SERVICE_UNAVAILABLE, json!(self.to_string())),
             ClewdrError::InvalidCookie { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::PathNotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
