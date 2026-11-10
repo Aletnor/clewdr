@@ -348,7 +348,7 @@ pub async fn api_health(State(s): State<CookieActorHandle>) -> StatusCode {
     }
 }
 
-const MODEL_LIST: [&str; 42] = [
+const MODEL_LIST: [&str; 44] = [
     "claude-3-7-sonnet-20250219",
     "claude-3-7-sonnet-20250219-thinking",
     "claude-sonnet-4-20250514",
@@ -381,6 +381,8 @@ const MODEL_LIST: [&str; 42] = [
     "claude-fable-5-thinking",
     "claude-fable-5-1",
     "claude-fable-5-1-thinking",
+    "claude-fable-5-2",
+    "claude-fable-5-2-thinking",
     "claude-opus-5",
     "claude-opus-5-thinking",
     "claude-sonnet-5",
@@ -396,10 +398,11 @@ const MODEL_LIST: [&str; 42] = [
 /// Models that take an effort suffix on the name, and the suffixes. Both follow
 /// the handling in middleware/claude/request.rs: the suffix is stripped there
 /// and becomes output_config.effort, which only these models keep.
-const EFFORT_MODELS: [&str; 7] = [
+const EFFORT_MODELS: [&str; 8] = [
     "claude-opus-4-8",
     "claude-fable-5",
     "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-opus-5",
     "claude-sonnet-5",
     "claude-opus-5-5",

@@ -72,7 +72,7 @@ chmod +x clewdr
 
 API 选 Claude，反向代理的地址和密码去面板「设置」页最上面的「接入酒馆」里复制（启动窗口里打印的也是这两样）。
 
-模型名直接填，例如 `claude-opus-5-5`、`claude-fable-5-1`、`claude-sonnet-5-5`、`claude-opus-4-6`。酒馆下拉框里没有新模型的话，装一个 Custom Models 扩展自己把名字加进去。
+模型名直接填，例如 `claude-opus-5-5`、`claude-fable-5-2`、`claude-sonnet-5-5`、`claude-opus-4-6`。酒馆下拉框里没有新模型的话，装一个 Custom Models 扩展自己把名字加进去。
 
 思考强度：
 

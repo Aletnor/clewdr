@@ -115,7 +115,8 @@ pub(super) async fn lookup(
 }
 
 /// 分流探测查询的型号列表；响应中 additional_model_options 列出的其他型号会追加查询
-const PROBE_MODELS: [&str; 12] = [
+const PROBE_MODELS: [&str; 13] = [
+    "claude-fable-5-2",
     "claude-fable-5-1",
     "claude-opus-5-5",
     "claude-sonnet-5-5",
